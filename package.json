@@ -1,0 +1,21 @@
+{
+  "name": "nl-cost-aware-trading-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TypeScript fee-aware stock/crypto research bot with historical backtesting and guarded IBKR order entry.",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "backtest": "npm run build && node dist/src/cli.js backtest --data data/sample.csv --config config/default.json",
+    "backtest:json": "npm run build && node dist/src/cli.js backtest --data data/sample.csv --config config/default.json --json",
+    "test": "npm run build && node --test dist/test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
+}
