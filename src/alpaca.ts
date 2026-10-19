@@ -68,10 +68,22 @@ export function dataRequest(endpoint: string): Promise<any> {
   return fetchJson(`${DATA_URL}${endpoint}`);
 }
 
-export async function getAccount(baseUrl: string): Promise<{ id: string; isPaper: boolean; equity: number }> {
+export async function getAccount(baseUrl: string): Promise<{
+  id: string;
+  isPaper: boolean;
+  equity: number;
+  buyingPower: number;
+  cash: number;
+}> {
   const account = await request(baseUrl, "/v2/account");
   const isPaper = new URL(baseUrl).hostname.startsWith("paper-");
-  return { id: String(account.id), isPaper, equity: Number(account.equity) };
+  return {
+    id: String(account.id),
+    isPaper,
+    equity: Number(account.equity),
+    buyingPower: Number(account.buying_power),
+    cash: Number(account.cash),
+  };
 }
 
 export async function getPositions(baseUrl: string): Promise<any[]> {

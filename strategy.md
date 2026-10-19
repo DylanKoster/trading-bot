@@ -4,7 +4,7 @@ This project is a research bot with an optional, explicitly gated Alpaca automat
 
 ## Design goal
 
-The strategy is deliberately long-only and low-turnover. It is intended for a beginner using unleveraged stocks first, with spot crypto as an optional higher-risk experiment. The bot trades one asset at a time, risks a fixed fraction of equity, and refuses to open a position when the fee-adjusted order cannot fit the cash balance.
+The strategy is deliberately long-only and low-turnover. It is intended for a beginner using unleveraged stocks first, with spot crypto as an optional higher-risk experiment. The automatic stock scanner can hold a diversified basket, risks a fixed fraction of equity per position, and refuses to open a position when the fee-adjusted order cannot fit the cash/buying-power budget.
 
 ## Entry
 
@@ -21,7 +21,7 @@ The next-open execution avoids look-ahead bias from using a closing price that w
 - Initial stop: entry price minus 2.5 ATR.
 - Trailing stop: the highest closing price since entry minus 2.5 ATR. It only moves upward.
 - Indicator exit: schedules an exit for the next open if the fast EMA falls below the slow EMA or RSI reaches 74.
-- Position sizing: the smaller of (a) 1% of current equity divided by the ATR stop distance and (b) 25% of equity. Stocks are whole-share by default; crypto can use decimals.
+- Position sizing: the smaller of (a) `riskPerTrade` of current equity divided by the ATR stop distance, (b) `maxPositionPct` of equity, and (c) the remaining portfolio/buying-power budget. The default automatic stock configuration allows up to 95% total long allocation across at most 10 positions, with a 10% per-position cap. Stocks are whole-share by default; crypto can use decimals.
 - No leverage, shorting, pyramiding, or overnight financing is modeled.
 
 ## Fees and execution assumptions

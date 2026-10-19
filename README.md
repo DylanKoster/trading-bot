@@ -63,7 +63,7 @@ The included sample is deliberately small and synthetic. It is a smoke test for 
 
 ## Automatic strategy execution
 
-The `auto-trade` command runs continuously and scans the `scanSymbols` candidate list in `config/default.json`. It evaluates each candidate with the configured daily strategy and selects the first candidate in that list with an entry signal; otherwise it chooses not to trade. The default list is an editable starter universe, not a recommendation. It ignores the current, still-forming daily candle, uses account equity for sizing, and manages at most one bot position at a time. It scans every five minutes by default and retries after temporary API errors. Press Ctrl+C to stop. This scanner uses the IEX bars and quotes already used by the bot; it does not call Alpaca's SIP-only most-active screener.
+The `auto-trade` command runs continuously and scans the `scanSymbols` candidate list in `config/default.json`. It manages existing bot positions first, then evaluates the remaining candidates and can submit multiple qualifying entries in one cycle. Portfolio allocation is capped by `maxPortfolioPct` and `maxOpenPositions`; each position is capped by `maxPositionPct` and the ATR risk budget. The default list is an editable starter universe, not a recommendation. It ignores the current, still-forming daily candle, uses account equity and broker buying power for sizing, and reserves capital for existing positions and open buy orders. It scans every five minutes by default and retries after temporary API errors. Press Ctrl+C to stop. This scanner uses the IEX bars and quotes already used by the bot; it does not call Alpaca's SIP-only most-active screener.
 
 Preview mode does not submit orders:
 
@@ -91,7 +91,7 @@ node dist/src/cli.js auto-trade --config config/default.json --interval-minutes 
   --live --confirm-auto-trading "ENABLE AUTONOMOUS AUTO TRADING"
 ```
 
-Automatic entries are whole-share DAY limit orders with an attached Alpaca OTO stop-loss order. Position size uses `riskPerTrade`, `maxPositionPct`, current account equity, the ATR stop distance, and `LIVE_MAX_ORDER_NOTIONAL` (default 1,000). The scanner will not add a new position while any account position or open order needs reconciliation. Indicator exits cancel the attached stop and wait for Alpaca to confirm cancellation before submitting a regular-hours DAY limit sell. A pending exit can leave the position without its stop until that sell fills, so check the account when an exit is pending. The runner will not manage positions it did not open, short positions, or ambiguous broker states. It persists order ownership and processed-bar state in `data/auto-<symbol>.json`; reconcile Alpaca orders and positions before clearing an `inFlight` marker after an interrupted or ambiguous API request.
+Automatic entries are whole-share DAY limit orders with an attached Alpaca OTO stop-loss order. Position size uses `riskPerTrade`, `maxPositionPct`, the configured portfolio budget, current account buying power, current account equity, and the ATR stop distance. There is no implicit automatic order-notional cap; set `AUTO_MAX_ORDER_NOTIONAL` when an additional per-order ceiling is desired. `LIVE_MAX_ORDER_NOTIONAL` is also honored for compatibility. Indicator exits cancel the attached stop and wait for Alpaca to confirm cancellation before submitting a regular-hours DAY limit sell. A pending exit can leave the position without its stop until that sell fills, so check the account when an exit is pending. The runner will not manage positions it did not open, short positions, or ambiguous broker states. It persists order ownership and processed-bar state in `data/auto-<symbol>.json`; reconcile Alpaca orders and positions before clearing an `inFlight` marker after an interrupted or ambiguous API request.
 
 The runner requires about two years of daily history and a current quote. Alpaca's account permissions, market-data subscription, and asset availability determine whether a request can be served. Orders may be rejected or remain unfilled; preview mode cannot verify broker acceptance.
 
@@ -104,6 +104,8 @@ Copy `config/default.json` and change:
 - `startingCapital`: virtual starting cash in EUR
 - `riskPerTrade`: equity fraction at risk per position
 - `maxPositionPct`: maximum notional allocation
+- `maxPortfolioPct`: maximum fraction of equity allocated across all long positions
+- `maxOpenPositions`: maximum simultaneous positions, including pending entries
 - `scanSymbols`: candidate stock symbols the strategy may choose among
 - `atrStopMultiple`, `slippageBps`, and indicator periods
 - `allowFractionalShares`: set `true` for fractional stock sizing when the chosen venue and instrument support it

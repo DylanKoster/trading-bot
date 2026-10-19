@@ -25,6 +25,10 @@ export interface AutoConfig {
   startingCapital: number;
   riskPerTrade: number;
   maxPositionPct: number;
+  /** Maximum fraction of equity that may be allocated to long positions. */
+  maxPortfolioPct?: number;
+  /** Maximum number of simultaneous long positions, including pending entries. */
+  maxOpenPositions?: number;
   atrStopMultiple: number;
   indicators: IndicatorSettings;
   scanSymbols?: string[];
@@ -37,6 +41,10 @@ export interface AutoOptions {
   submit: boolean;
   allowPaper?: boolean;
   dataDir?: string;
+  /** Remaining portfolio allocation available for a new entry. */
+  allocationBudget?: number;
+  /** Current broker buying power, used as a hard cash ceiling. */
+  buyingPower?: number;
 }
 
 export interface AutonomousOptions {
@@ -142,6 +150,56 @@ function csvForBars(bars: Bar[]): string {
       ),
     ].join("\n") + "\n"
   );
+}
+
+function optionalPositiveEnvironmentNumber(name: string): number | null {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0)
+    throw new Error(`${name} must be positive`);
+  return value;
+}
+
+function automaticOrderNotionalCap(): number {
+  // A cap is still available for operators who want one, but the old implicit
+  // 1,000 cap made a 100,000 account invest only a few thousand dollars.
+  return (
+    optionalPositiveEnvironmentNumber("AUTO_MAX_ORDER_NOTIONAL") ??
+    optionalPositiveEnvironmentNumber("LIVE_MAX_ORDER_NOTIONAL") ??
+    Number.POSITIVE_INFINITY
+  );
+}
+
+function portfolioCap(config: AutoConfig): number {
+  const value = config.maxPortfolioPct ?? 0.95;
+  if (!Number.isFinite(value) || value <= 0 || value > 1)
+    throw new Error("maxPortfolioPct must be greater than 0 and no greater than 1");
+  return value;
+}
+
+function openPositionCap(config: AutoConfig, universeSize: number): number {
+  const value = config.maxOpenPositions ?? Math.min(10, Math.max(1, universeSize));
+  if (!Number.isInteger(value) || value < 1)
+    throw new Error("maxOpenPositions must be a positive whole number");
+  return value;
+}
+
+function orderNotional(order: any): number {
+  const quantity = Math.abs(Number(order?.qty || order?.quantity || 0));
+  const price = Number(order?.limit_price || order?.stop_price || 0);
+  return Number.isFinite(quantity) && Number.isFinite(price) && quantity > 0 && price > 0
+    ? quantity * price
+    : 0;
+}
+
+function longPositionNotional(position: any): number {
+  const quantity = Number(position?.qty || 0);
+  if (!Number.isFinite(quantity) || quantity <= 0) return 0;
+  const marketValue = Number(position?.market_value);
+  if (Number.isFinite(marketValue) && marketValue > 0) return marketValue;
+  const price = Number(position?.current_price || position?.avg_entry_price || 0);
+  return Number.isFinite(price) && price > 0 ? quantity * price : 0;
 }
 
 async function getDailyHistory(
@@ -586,11 +644,28 @@ export async function runAutomaticOnce(
     };
   const riskQuantity = (equity * config.riskPerTrade) / (quote.ask - stopPrice);
   const positionLimit = (equity * config.maxPositionPct) / quote.ask;
-  const maxNotional = Number(process.env.LIVE_MAX_ORDER_NOTIONAL || 1000);
-  if (!Number.isFinite(maxNotional) || maxNotional <= 0)
-    throw new Error("LIVE_MAX_ORDER_NOTIONAL must be positive");
+  const configuredBudget = options.allocationBudget ?? Number.POSITIVE_INFINITY;
+  const accountBuyingPower = Number(account.buyingPower);
+  const buyingPowerBudget = options.buyingPower ?? (
+    Number.isFinite(accountBuyingPower)
+      ? Math.max(0, accountBuyingPower)
+      : Number.POSITIVE_INFINITY
+  );
+  if (!Number.isFinite(configuredBudget) && configuredBudget !== Number.POSITIVE_INFINITY)
+    throw new Error("allocationBudget must be finite and non-negative");
+  if (!Number.isFinite(buyingPowerBudget) && buyingPowerBudget !== Number.POSITIVE_INFINITY)
+    throw new Error("buyingPower must be finite and non-negative");
+  if (configuredBudget < 0 || buyingPowerBudget < 0)
+    throw new Error("allocationBudget and buyingPower must be non-negative");
+  const allocationBudget = Math.min(configuredBudget, buyingPowerBudget);
+  const maxNotional = automaticOrderNotionalCap();
   const quantity = Math.floor(
-    Math.min(riskQuantity, positionLimit, maxNotional / quote.ask),
+    Math.min(
+      riskQuantity,
+      positionLimit,
+      maxNotional / quote.ask,
+      allocationBudget / quote.ask,
+    ),
   );
   if (quantity < 1)
     return {
@@ -598,7 +673,7 @@ export async function runAutomaticOnce(
       bar: latest.date,
       action: "no entry",
       reason:
-        "Risk, allocation, or order-notional caps allow fewer than one share",
+        "Risk, portfolio allocation, buying-power, or order-notional caps allow fewer than one share",
     };
 
   const bracket = {
@@ -685,6 +760,13 @@ export async function runAutonomousCycle(
     throw new Error("Alpaca returned invalid account equity; no strategy action taken");
 
   const dataDir = path.resolve(options.dataDir || "data");
+  const symbols = [...new Set((options.config.scanSymbols || [])
+    .map((symbol) => String(symbol).trim().toUpperCase())
+    .filter((symbol) => /^[A-Z0-9.-]{1,16}$/.test(symbol)))];
+  if (symbols.length === 0)
+    throw new Error("Add one or more candidate tickers to scanSymbols in the config file");
+  const maxPortfolioPct = portfolioCap(options.config);
+  const maxOpenPositions = openPositionCap(options.config, symbols.length);
   const accountPositions = await getPositions(baseUrl);
   const heldSymbols = accountPositions
     .filter((position) => Number(position?.qty || 0) !== 0)
@@ -703,42 +785,63 @@ export async function runAutonomousCycle(
 
   // Reconcile and manage an existing bot position or pending action before scanning entries.
   const managedSymbols = [...new Set([...heldSymbols, ...trackedSymbols])];
-  if (managedSymbols.length > 0) {
-    const decisions: Record<string, unknown>[] = [];
-    for (const symbol of managedSymbols) {
-      decisions.push(
-        await runAutomaticOnce({
-          symbol,
-          equity: account.equity,
-          config: options.config,
-          submit: options.submit,
-          allowPaper: options.allowPaper,
-          dataDir,
-        }),
-      );
-    }
-    return {
-      action: "managed existing position or pending order; no new entry considered",
-      equity: account.equity,
-      decisions,
-    };
+  const openOrders = await getOpenOrders(baseUrl);
+  const decisions: Record<string, unknown>[] = [];
+  for (const symbol of managedSymbols) {
+    decisions.push(
+      await runAutomaticOnce({
+        symbol,
+        equity: account.equity,
+        config: options.config,
+        submit: options.submit,
+        allowPaper: options.allowPaper,
+        dataDir,
+      }),
+    );
   }
 
-  const openOrders = await getOpenOrders(baseUrl);
-  if (openOrders.length > 0)
-    return {
-      action: "waiting for account open orders; no new entry considered",
-      openOrderCount: openOrders.length,
-    };
+  const positivePositions = accountPositions.filter((position) => Number(position?.qty || 0) > 0);
+  const existingLongNotional = positivePositions.reduce(
+    (sum, position) => sum + longPositionNotional(position),
+    0,
+  );
+  const openBuyOrders = openOrders.filter(
+    (order) => String(order?.side || "").toLowerCase() === "buy",
+  );
+  const openBuyNotional = openBuyOrders.reduce(
+    (sum, order) => sum + orderNotional(order),
+    0,
+  );
+  const accountBuyingPower = Number(account.buyingPower);
+  const availableBuyingPower = Number.isFinite(accountBuyingPower)
+    ? Math.max(0, accountBuyingPower)
+    : Number.POSITIVE_INFINITY;
+  let remainingPortfolioBudget = Math.max(
+    0,
+    account.equity * maxPortfolioPct - existingLongNotional - openBuyNotional,
+  );
+  // Alpaca's buying_power already reflects broker reservations. Open buy
+  // orders are subtracted from the portfolio budget above, but not again here.
+  let remainingBuyingPower = availableBuyingPower;
+  let activePositionCount = positivePositions.length +
+    [...trackedSymbols].filter((symbol) => !heldSymbols.includes(symbol)).length;
+  const openBuySymbols = new Set(
+    openBuyOrders
+      .map((order) => String(order?.symbol || "").toUpperCase())
+      .filter(Boolean),
+  );
 
-  const symbols = [...new Set((options.config.scanSymbols || [])
-    .map((symbol) => String(symbol).trim().toUpperCase())
-    .filter((symbol) => /^[A-Z0-9.-]{1,16}$/.test(symbol)))];
-  if (symbols.length === 0)
-    throw new Error("Add one or more candidate tickers to scanSymbols in the config file");
-
-  const decisions: Record<string, unknown>[] = [];
-  for (const symbol of symbols) {
+  for (const symbol of symbols.filter((candidate) => !managedSymbols.includes(candidate))) {
+    if (activePositionCount >= maxOpenPositions) break;
+    if (openBuySymbols.has(symbol)) {
+      decisions.push({
+        symbol,
+        action: "candidate skipped",
+        reason: "an open buy order already exists for this symbol",
+      });
+      continue;
+    }
+    if (remainingPortfolioBudget < 1 || remainingBuyingPower < 1) break;
     try {
       const decision = await runAutomaticOnce({
         symbol,
@@ -747,15 +850,18 @@ export async function runAutonomousCycle(
         submit: options.submit,
         allowPaper: options.allowPaper,
         dataDir,
+        allocationBudget: remainingPortfolioBudget,
+        buyingPower: remainingBuyingPower,
       });
       decisions.push(decision);
-      if (["preview entry bracket", "submitted entry bracket"].includes(String(decision.action)))
-        return {
-          action: options.submit ? "selected and submitted the highest-ranked qualifying candidate" : "selected the highest-ranked qualifying candidate (preview only)",
-          equity: account.equity,
-          candidatesScanned: decisions.length,
-          decisions,
-        };
+      if (["preview entry bracket", "submitted entry bracket"].includes(String(decision.action))) {
+        const notional = Number(decision.quantity) * Number(decision.limitPrice);
+        if (Number.isFinite(notional) && notional > 0) {
+          remainingPortfolioBudget = Math.max(0, remainingPortfolioBudget - notional);
+          remainingBuyingPower = Math.max(0, remainingBuyingPower - notional);
+          activePositionCount += 1;
+        }
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (options.submit && /unknown|inspect|manual|inFlight|protective stop|reconcile/i.test(message))
@@ -764,8 +870,13 @@ export async function runAutonomousCycle(
     }
   }
   return {
-    action: "no qualifying entry; chose not to trade",
+    action: managedSymbols.length > 0
+      ? "managed existing positions and scanned for additional entries"
+      : "no qualifying entry; chose not to trade",
     equity: account.equity,
+    portfolioBudget: account.equity * maxPortfolioPct,
+    remainingPortfolioBudget,
+    maxOpenPositions,
     candidatesScanned: decisions.length,
     decisions,
   };
