@@ -1,10 +1,15 @@
 {
   "assetClass": "stock",
-  "platform": "ibkr_nl_tiered",
+  "platform": "alpaca_us_equity",
   "startingCapital": 10000,
   "riskPerTrade": 0.01,
   "maxPositionPct": 0.25,
   "atrStopMultiple": 2.5,
+  "scanSymbols": [
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO",
+    "JPM", "WMT", "XOM", "LLY", "ORCL", "AMD", "NFLX", "COST",
+    "BA", "PLTR", "TSM", "INTC"
+  ],
   "slippageBps": 5,
   "indicators": {
     "fastEma": 10,

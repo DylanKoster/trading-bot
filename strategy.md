@@ -1,6 +1,6 @@
 # Cost-aware trend-pullback strategy
 
-This project is a research bot with an optional, explicitly gated IBKR automatic execution runner. It evaluates daily bars, places strategy orders only when live mode is enabled, and tracks the positions and orders it opened. It does not promise profits. Backtests are hypothetical: historical data can be wrong, markets change, and live execution adds spreads, latency, partial fills, taxes, and outages.
+This project is a research bot with an optional, explicitly gated Alpaca automatic execution runner. It evaluates daily bars, places strategy orders only when live mode is enabled, and tracks the positions and orders it opened. It does not promise profits. Backtests are hypothetical: historical data can be wrong, markets change, and live execution adds spreads, latency, partial fills, taxes, and outages.
 
 ## Design goal
 
@@ -26,7 +26,7 @@ The next-open execution avoids look-ahead bias from using a closing price that w
 
 ## Fees and execution assumptions
 
-Every buy and sell includes the configured platform fee and price slippage. A monthly platform fee, if configured, is charged on the first bar of each calendar month. The default stock profile uses Interactive Brokers Netherlands tiered pricing: 0.05% with a €1.25 minimum and €29 maximum per order. The default crypto profile uses Kraken Pro spot entry-tier taker pricing: 0.80%; maker pricing is available as a separate profile.
+Every buy and sell includes the configured platform fee and price slippage. A monthly platform fee, if configured, is charged on the first bar of each calendar month. The default stock profile estimates zero commission for Alpaca US equity orders. The default crypto profile uses Kraken Pro spot entry-tier taker pricing: 0.80%; maker pricing is available as a separate profile.
 
 The model uses a conservative taker-like assumption for market/open and stop fills. It does not assume maker rebates, tax treatment, dividends, bid/ask spread beyond the slippage setting, or favorable partial fills.
 

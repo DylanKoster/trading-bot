@@ -17,6 +17,7 @@ export interface BacktestConfig {
   atrStopMultiple: number;
   slippageBps: number;
   allowFractionalShares?: boolean;
+  scanSymbols?: string[];
   indicators: IndicatorSettings;
 }
 

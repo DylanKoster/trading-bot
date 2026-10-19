@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import { runAutomaticOnce } from "./auto";
+import { runAutonomousCycle } from "./auto";
 import { backtest, loadCsv, type BacktestConfig } from "./backtest";
-import { placeOrder, type OrderInput } from "./ibkr";
+import { placeOrder, type OrderInput } from "./alpaca";
 
 type CliArgs = Record<string, string | true>;
 
@@ -64,7 +64,6 @@ function parseOrderArgs(args: CliArgs): OrderInput {
   const sideValue = stringArg(args, "side").toUpperCase();
   const quantity = Number(stringArg(args, "quantity"));
   const limitPrice = Number(stringArg(args, "limit-price"));
-  const conid = stringArg(args, "conid") || undefined;
   if (!/^[A-Z0-9.-]{1,16}$/.test(symbol))
     throw new Error("Provide a valid stock --symbol");
   if (sideValue !== "BUY" && sideValue !== "SELL")
@@ -79,8 +78,6 @@ function parseOrderArgs(args: CliArgs): OrderInput {
   }
   if (!Number.isFinite(limitPrice) || limitPrice <= 0)
     throw new Error("--limit-price must be a positive number");
-  if (conid && !/^\d+$/.test(conid))
-    throw new Error("--conid must be a numeric IBKR contract ID");
   if (args.live && args.live !== true)
     throw new Error("--live is a flag and takes no value");
   const confirmationValue = args["confirm-live-order"];
@@ -93,7 +90,6 @@ function parseOrderArgs(args: CliArgs): OrderInput {
     side,
     quantity,
     limitPrice,
-    conid,
     submit: args.live === true,
     confirmation:
       typeof confirmationValue === "string" ? confirmationValue : undefined,
@@ -117,69 +113,43 @@ async function main(): Promise<void> {
   }
   if (command === "auto-trade") {
     const args = argsToObject(argv);
-    const symbol = stringArg(args, "symbol").toUpperCase();
-    const equity = Number(stringArg(args, "equity"));
-    const conid = stringArg(args, "conid") || undefined;
     const configPath = path.resolve(
       stringArg(args, "config") || "config/default.json",
     );
     const config = JSON.parse(
       fs.readFileSync(configPath, "utf8"),
     ) as BacktestConfig;
-    if (!/^[A-Z0-9.-]{1,16}$/.test(symbol))
-      throw new Error("Provide a valid stock --symbol");
-    if (conid && !/^\d+$/.test(conid))
-      throw new Error("--conid must be a numeric IBKR contract ID");
-    if (!Number.isFinite(equity) || equity <= 0)
-      throw new Error(
-        "--equity is required and must be positive in the contract currency",
-      );
+    if (args.symbol || args.equity)
+      throw new Error("auto-trade scans the market automatically; --symbol and --equity are not accepted");
     if (args.live && args.live !== true)
       throw new Error("--live is a flag and takes no value");
-    if (args.watch && args.watch !== true)
-      throw new Error("--watch is a flag and takes no value");
+    const intervalMinutes = Number(stringArg(args, "interval-minutes") || 5);
+    if (!Number.isFinite(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 60)
+      throw new Error("--interval-minutes must be between 1 and 60");
     const confirmation = stringArg(args, "confirm-auto-trading");
-    if (args.live && confirmation !== `ENABLE AUTO TRADING ${symbol}`) {
+    if (args.live && confirmation !== "ENABLE AUTONOMOUS AUTO TRADING") {
       throw new Error(
-        `Live automation requires --confirm-auto-trading "ENABLE AUTO TRADING ${symbol}"`,
+        'Live automation requires --confirm-auto-trading "ENABLE AUTONOMOUS AUTO TRADING"',
       );
     }
     if (!args.live && confirmation)
       throw new Error("--confirm-auto-trading requires --live");
-    const options = {
-      symbol,
-      equity,
-      config,
-      conid,
-      submit: args.live === true,
-    };
-    const runOnce = async () => {
-      const result = await runAutomaticOnce(options);
-      console.log(JSON.stringify(result, null, 2));
-      return result;
-    };
-    try {
-      await runOnce();
-      if (args.watch) {
-        console.log(
-          "Watching for new completed daily bars; press Ctrl+C to stop.",
+    console.log(`Autonomous scanner running every ${intervalMinutes} minute(s); press Ctrl+C to stop.`);
+    while (true) {
+      try {
+        const result = await runAutonomousCycle({ config, submit: args.live === true });
+        console.log(JSON.stringify({ at: new Date().toISOString(), ...result }, null, 2));
+      } catch (error) {
+        console.error(
+          `Automatic scan failed: ${error instanceof Error ? error.message : String(error)}. Will retry next cycle.`,
         );
-        while (true) {
-          await new Promise((resolve) => setTimeout(resolve, 5 * 60 * 1000));
-          await runOnce();
-        }
       }
-    } catch (error) {
-      console.error(
-        `Automatic strategy failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      process.exitCode = 1;
+      await new Promise((resolve) => setTimeout(resolve, intervalMinutes * 60 * 1000));
     }
-    return;
   }
   if (command !== "backtest") {
     console.error(
-      'Usage:\n  node dist/src/cli.js backtest --data data/file.csv --config config/default.json [--json]\n  node dist/src/cli.js place-order --symbol AAPL --side BUY --quantity 1 --limit-price 200 [--conid IBKR_CONID] [--live --confirm-live-order "SUBMIT AAPL BUY 1 LMT 200"]\n  node dist/src/cli.js auto-trade --symbol AAPL --equity 10000 --config config/default.json [--watch] [--live --confirm-auto-trading "ENABLE AUTO TRADING AAPL"]',
+      'Usage:\n  node dist/src/cli.js backtest --data data/file.csv --config config/default.json [--json]\n  node dist/src/cli.js place-order --symbol AAPL --side BUY --quantity 1 --limit-price 200 [--live --confirm-live-order "SUBMIT AAPL BUY 1 LMT 200"]\n  node dist/src/cli.js auto-trade --config config/default.json [--interval-minutes 5] [--live --confirm-auto-trading "ENABLE AUTONOMOUS AUTO TRADING"]',
     );
     process.exitCode = 1;
     return;

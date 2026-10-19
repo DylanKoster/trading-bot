@@ -9,12 +9,12 @@ export interface FeeProfile {
 }
 
 export const FEE_PROFILES: Record<string, FeeProfile> = {
-  ibkr_nl_tiered: {
-    label: "Interactive Brokers Netherlands - tiered stocks",
+  alpaca_us_equity: {
+    label: "Alpaca US equities - commission-free estimate",
     assetClass: "stock",
-    rate: 0.0005,
-    min: 1.25,
-    max: 29,
+    rate: 0,
+    min: 0,
+    max: Infinity,
     fixed: 0,
     monthly: 0,
   },

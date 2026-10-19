@@ -3,11 +3,15 @@ import path from "node:path";
 import {
   getAccount,
   getBaseUrl,
-  getLiveQuote,
+  getQuote,
   getStockContract,
+  getPositions,
+  getOpenOrders,
   request,
-  requireAuthenticatedSession,
-} from "./ibkr";
+  dataRequest,
+  getPosition as fetchPosition,
+  getOrder,
+} from "./alpaca";
 import {
   buildIndicators,
   entrySignal,
@@ -23,13 +27,19 @@ export interface AutoConfig {
   maxPositionPct: number;
   atrStopMultiple: number;
   indicators: IndicatorSettings;
+  scanSymbols?: string[];
 }
 
 export interface AutoOptions {
   symbol: string;
   equity: number;
   config: AutoConfig;
-  conid?: string;
+  submit: boolean;
+  dataDir?: string;
+}
+
+export interface AutonomousOptions {
+  config: AutoConfig;
   submit: boolean;
   dataDir?: string;
 }
@@ -45,20 +55,12 @@ interface AutoPosition {
 
 interface AutoState {
   accountId: string;
-  conid: string;
+  symbol: string;
+  assetId: string;
   lastProcessedBar: string | null;
   position: AutoPosition | null;
   inFlight: string | null;
   exitOrderId?: string | null;
-}
-
-interface HistoryBar {
-  t: number;
-  o: number;
-  h: number;
-  l: number;
-  c: number;
-  v?: number;
 }
 
 const NEW_YORK_TZ = "America/New_York";
@@ -98,18 +100,20 @@ function isRegularSession(): boolean {
 function loadState(
   filePath: string,
   accountId: string,
-  conid: string,
+  symbol: string,
+  assetId: string,
 ): AutoState {
   if (!fs.existsSync(filePath))
     return {
       accountId,
-      conid,
+      symbol,
+      assetId,
       lastProcessedBar: null,
       position: null,
       inFlight: null,
     };
   const state = JSON.parse(fs.readFileSync(filePath, "utf8")) as AutoState;
-  if (state.accountId !== accountId || String(state.conid) !== String(conid)) {
+  if (state.accountId !== accountId || state.symbol !== symbol || String(state.assetId) !== String(assetId)) {
     throw new Error(
       `Auto-trading state at ${filePath} belongs to a different account or contract; inspect it before continuing`,
     );
@@ -139,24 +143,16 @@ function csvForBars(bars: Bar[]): string {
 }
 
 async function getDailyHistory(
-  baseUrl: string,
-  conid: string | number,
+  symbol: string,
 ): Promise<Bar[]> {
-  const query = new URLSearchParams({
-    conid: String(conid),
-    period: "2y",
-    bar: "1d",
-    outsideRth: "false",
-  });
-  const response = await request(
-    baseUrl,
-    `/iserver/marketdata/history?${query}`,
-  );
-  if (!Array.isArray(response?.data))
-    throw new Error("IBKR did not return daily historical bars");
-  const bars: Bar[] = (response.data as HistoryBar[])
+  const start = new Date(Date.now() - 3 * 365 * 24 * 60 * 60 * 1000).toISOString();
+  const query = new URLSearchParams({ timeframe: "1Day", start, limit: "10000", adjustment: "all", feed: "iex" });
+  const response = await dataRequest(`/v2/stocks/${encodeURIComponent(symbol)}/bars?${query}`);
+  if (!Array.isArray(response?.bars))
+    throw new Error("Alpaca did not return daily historical bars");
+  const bars: Bar[] = (response.bars as any[])
     .map((item) => ({
-      date: newYorkDate(Number(item.t)),
+      date: newYorkDate(Date.parse(item.t)),
       open: Number(item.o),
       high: Number(item.h),
       low: Number(item.l),
@@ -172,7 +168,7 @@ async function getDailyHistory(
   const uniqueBars = [...new Map(bars.map((bar) => [bar.date, bar])).values()];
   if (uniqueBars.length < 400)
     throw new Error(
-      `IBKR returned only ${uniqueBars.length} daily bars; automatic strategy requires approximately two years of history`,
+      `Alpaca returned only ${uniqueBars.length} daily bars; automatic strategy requires approximately two years of history`,
     );
   const first = new Date(`${uniqueBars[0].date}T00:00:00Z`).getTime();
   const last = new Date(
@@ -180,115 +176,80 @@ async function getDailyHistory(
   ).getTime();
   if (last - first < 700 * 24 * 60 * 60 * 1000)
     throw new Error(
-      "IBKR daily history spans less than two calendar years; no strategy action taken",
+      "Alpaca daily history spans less than two calendar years; no strategy action taken",
     );
   return uniqueBars;
 }
 
-async function getPosition(
-  baseUrl: string,
-  accountId: string,
-  conid: string,
-): Promise<number> {
-  const positions = await request(
-    baseUrl,
-    `/portfolio/${encodeURIComponent(accountId)}/positions/0`,
-  );
-  if (!Array.isArray(positions))
-    throw new Error("IBKR returned an invalid positions response");
-  return Number(
-    positions.find((item) => String(item.conid) === conid)?.position || 0,
-  );
-}
-
-function checkPreview(preview: unknown): string | null {
-  const items = Array.isArray(preview) ? preview : [preview];
-  const errors = items.map((item: any) => item?.error).filter(Boolean);
-  if (errors.length)
-    throw new Error(`IBKR what-if rejected the order: ${errors.join("; ")}`);
-  const warnings = items.map((item: any) => item?.warn).filter(Boolean);
-  return warnings.length
-    ? `IBKR what-if warning; no order submitted: ${warnings.join("; ")}`
-    : null;
+async function getPosition(baseUrl: string, symbol: string): Promise<number> {
+  const position = await fetchPosition(baseUrl, symbol);
+  return Number(position?.qty || 0);
 }
 
 async function submitPayload(
   baseUrl: string,
-  accountId: string,
-  payload: Record<string, unknown>[],
+  payload: Record<string, unknown>,
 ): Promise<unknown> {
   try {
     return await request(
       baseUrl,
-      `/iserver/account/${encodeURIComponent(accountId)}/orders`,
+      "/v2/orders",
       {
         method: "POST",
-        body: JSON.stringify({ orders: payload }),
+        body: JSON.stringify(payload),
       },
     );
   } catch (error) {
     throw new Error(
-      `IBKR submission status is unknown; inspect open orders and positions before restarting. ${error instanceof Error ? error.message : String(error)}`,
+      `Alpaca submission status is unknown; inspect open orders and positions before restarting. ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
 
 async function updateStop(
   baseUrl: string,
-  accountId: string,
-  conid: string,
   state: AutoState,
   nextStop: number,
 ): Promise<void> {
   const position = state.position;
   if (!position || nextStop <= position.stopPrice || nextStop <= 0) return;
-  const result = await request(
-    baseUrl,
-    `/iserver/account/${encodeURIComponent(accountId)}/order/${encodeURIComponent(position.stopOrderId)}`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        conid: Number(conid),
-        orderType: "STP",
-        price: Number(nextStop.toFixed(2)),
-        side: "SELL",
-        tif: "GTC",
-        quantity: position.quantity,
-        outsideRTH: false,
-      }),
-    },
-  );
-  const items = Array.isArray(result) ? result : [result];
-  if (
-    items.some(
-      (item: any) => item?.error || (item?.id && Array.isArray(item?.message)),
-    )
-  ) {
+  await cancelStopAndConfirm(baseUrl, position.stopOrderId);
+  const result = await request(baseUrl, "/v2/orders", {
+    method: "POST",
+    body: JSON.stringify({
+      symbol: state.symbol,
+      qty: String(position.quantity),
+      side: "sell",
+      type: "stop",
+      time_in_force: "gtc",
+      stop_price: String(Number(nextStop.toFixed(2))),
+    }),
+  });
+  if (!result?.id)
     throw new Error(
-      `IBKR stop update needs manual review; protective stop remains at ${position.stopPrice}. Response: ${JSON.stringify(result)}`,
+      `Alpaca returned no replacement stop order ID. Protective stop update needs manual review: ${JSON.stringify(result)}`,
     );
-  }
+  position.stopOrderId = String(result.id);
   position.stopPrice = Number(nextStop.toFixed(2));
 }
 
 async function cancelStopAndConfirm(
   baseUrl: string,
-  accountId: string,
   orderId: string,
 ): Promise<void> {
   await request(
     baseUrl,
-    `/iserver/account/${encodeURIComponent(accountId)}/order/${encodeURIComponent(orderId)}`,
+    `/v2/orders/${encodeURIComponent(orderId)}`,
     { method: "DELETE" },
   );
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     const status = await request(
       baseUrl,
-      `/iserver/account/${encodeURIComponent(accountId)}/order/status/${encodeURIComponent(orderId)}`,
+      `/v2/orders/${encodeURIComponent(orderId)}`,
     );
     const value = String(
-      status?.status || status?.order_status || "",
+      status?.status || "",
     ).toLowerCase();
     if (["cancelled", "canceled", "filled", "inactive"].includes(value)) {
       if (value === "filled")
@@ -303,16 +264,16 @@ async function cancelStopAndConfirm(
     }
   }
   throw new Error(
-    "IBKR has not confirmed cancellation of the protective stop; strategy exit was not submitted",
+    "Alpaca has not confirmed cancellation of the protective stop; strategy exit was not submitted",
   );
 }
 
 export async function runAutomaticOnce(
   options: AutoOptions,
 ): Promise<Record<string, unknown>> {
-  const { symbol, equity, config, conid: requestedConid, submit } = options;
+  const { symbol, equity, config, submit } = options;
   if (config.assetClass !== "stock")
-    throw new Error("Automatic IBKR execution supports stock configs only");
+    throw new Error("Automatic Alpaca execution supports stock configs only");
   if (!Number.isFinite(equity) || equity <= 0)
     throw new Error(
       "--equity must be a positive amount in the stock contract currency",
@@ -322,19 +283,18 @@ export async function runAutomaticOnce(
       "Set LIVE_TRADING_ENABLED=true to enable the live-order kill switch",
     );
   const baseUrl = getBaseUrl();
-  await requireAuthenticatedSession(baseUrl);
   const account = await getAccount(baseUrl);
   if (submit && account.isPaper)
     throw new Error(
-      "The selected account appears to be an IBKR paper account; live automatic trading stopped",
+      "ALPACA_BASE_URL points to a paper account; live automatic trading stopped",
     );
-  const contract = await getStockContract(baseUrl, symbol, requestedConid);
-  const contractId = String(contract.conid);
-  const bars = await getDailyHistory(baseUrl, contract.conid);
+  const contract = await getStockContract(baseUrl, symbol);
+  const assetId = String(contract.assetId);
+  const bars = await getDailyHistory(symbol);
   const dataDir = path.resolve(options.dataDir || "data");
   fs.mkdirSync(dataDir, { recursive: true });
   fs.writeFileSync(
-    path.join(dataDir, `${symbol.toLowerCase()}-ibkr-daily.csv`),
+    path.join(dataDir, `${symbol.toLowerCase()}-alpaca-daily.csv`),
     csvForBars(bars),
   );
 
@@ -343,30 +303,31 @@ export async function runAutomaticOnce(
   const closedBars = bars.filter((bar) => bar.date < today);
   if (closedBars.length < 40)
     throw new Error(
-      "Not enough completed IBKR daily bars for the configured indicators",
+      "Not enough completed Alpaca daily bars for the configured indicators",
     );
   const latest = closedBars[closedBars.length - 1];
   const indicators = buildIndicators(closedBars, config.indicators);
   const index = closedBars.length - 1;
   const atr = indicators.atr[index];
   const statePath = path.join(dataDir, `auto-${symbol.toLowerCase()}.json`);
-  const state = loadState(statePath, account.id, contractId);
+  const state = loadState(statePath, account.id, symbol, assetId);
   if (state.inFlight)
     throw new Error(
-      `Previous automatic action ${state.inFlight} has an unknown or incomplete outcome; reconcile IBKR orders and positions, then clear the state marker manually`,
+      `Previous automatic action ${state.inFlight} has an unknown or incomplete outcome; reconcile Alpaca orders and positions, then clear the state marker manually`,
     );
-  const held = await getPosition(baseUrl, account.id, contractId);
+  const held = await getPosition(baseUrl, symbol);
   if (state.exitOrderId) {
     const exitOrderId = state.exitOrderId;
-    const exitStatus = await request(
-      baseUrl,
-      `/iserver/account/${encodeURIComponent(account.id)}/order/status/${encodeURIComponent(exitOrderId)}`,
-    );
+    const exitStatus = await getOrder(baseUrl, exitOrderId);
     const status = String(
-      exitStatus?.status || exitStatus?.order_status || "",
+      exitStatus?.status || "",
     ).toLowerCase();
     if (
       [
+        "new",
+        "accepted",
+        "pending_new",
+        "partially_filled",
         "submitted",
         "presubmitted",
         "pending submit",
@@ -385,7 +346,7 @@ export async function runAutomaticOnce(
     if (status === "filled") {
       if (held !== 0)
         throw new Error(
-          `Exit order filled but IBKR still reports ${held} shares; reconcile any partial fill before restarting`,
+          `Exit order filled but Alpaca still reports ${held} shares; reconcile any partial fill before restarting`,
         );
       state.position = null;
       state.exitOrderId = null;
@@ -399,24 +360,50 @@ export async function runAutomaticOnce(
       };
     }
     throw new Error(
-      `Indicator exit order is ${status || "in an unknown state"} and its protective stop was canceled; inspect IBKR and manage the position manually`,
+      `Indicator exit order is ${status || "in an unknown state"} and its protective stop was canceled; inspect Alpaca and manage the position manually`,
     );
   }
   if (held > 0 && !state.position)
     throw new Error(
-      `IBKR holds ${held} ${symbol} shares, but this runner has no ownership state; refusing to manage an untracked position`,
+      `Alpaca holds ${held} ${symbol} shares, but this runner has no ownership state; refusing to manage an untracked position`,
     );
   if (held < 0)
     throw new Error(
-      `IBKR reports a short ${symbol} position; this long-only runner will not manage it`,
+      `Alpaca reports a short ${symbol} position; this long-only runner will not manage it`,
     );
+  if (state.position && !state.position.stopOrderId) {
+    const parentOrder = await getOrder(baseUrl, state.position.parentOrderId);
+    const parentStatus = String(parentOrder?.status || "").toLowerCase();
+    if (["new", "accepted", "pending_new", "partially_filled"].includes(parentStatus))
+      return {
+        symbol,
+        bar: latest.date,
+        action: "entry order awaiting fill",
+        orderId: state.position.parentOrderId,
+        status: parentStatus,
+      };
+    if (parentStatus === "filled") {
+      const stopOrderId = String(parentOrder?.legs?.[0]?.id || "");
+      if (!stopOrderId)
+        throw new Error(
+          "Alpaca reports the entry filled but returned no attached stop order; inspect open orders and protect the position manually",
+        );
+      state.position.stopOrderId = stopOrderId;
+      saveState(statePath, state);
+    } else if (["canceled", "cancelled", "rejected", "expired"].includes(parentStatus)) {
+      state.position = null;
+      state.lastProcessedBar = latest.date;
+      saveState(statePath, state);
+    } else {
+      throw new Error(
+        `Could not reconcile the entry order (${parentStatus || "unknown"}); inspect Alpaca before continuing`,
+      );
+    }
+  }
   if (state.position && held === 0) {
-    const stopStatus = await request(
-      baseUrl,
-      `/iserver/account/${encodeURIComponent(account.id)}/order/status/${encodeURIComponent(state.position.stopOrderId)}`,
-    );
+    const stopStatus = await getOrder(baseUrl, state.position.stopOrderId);
     const stopState = String(
-      stopStatus?.status || stopStatus?.order_status || "",
+      stopStatus?.status || "",
     ).toLowerCase();
     if (stopState === "filled") {
       const stopOrderId = state.position.stopOrderId;
@@ -430,15 +417,16 @@ export async function runAutomaticOnce(
         stopOrderId,
       };
     }
-    const parentStatus = await request(
-      baseUrl,
-      `/iserver/account/${encodeURIComponent(account.id)}/order/status/${encodeURIComponent(state.position.parentOrderId)}`,
-    );
+    const parentStatus = await getOrder(baseUrl, state.position.parentOrderId);
     const status = String(
-      parentStatus?.status || parentStatus?.order_status || "",
+      parentStatus?.status || "",
     ).toLowerCase();
     if (
       [
+        "new",
+        "accepted",
+        "pending_new",
+        "partially_filled",
         "submitted",
         "presubmitted",
         "pending submit",
@@ -456,11 +444,11 @@ export async function runAutomaticOnce(
     }
     if (status === "filled")
       throw new Error(
-        "IBKR says the entry filled but the position endpoint is flat; reconcile account positions before restarting",
+        "Alpaca says the entry filled but the position endpoint is flat; reconcile account positions before restarting",
       );
     if (!["cancelled", "canceled", "inactive"].includes(status)) {
       throw new Error(
-        `Could not reconcile pending entry order status (${status || "unknown"}); inspect IBKR before restarting`,
+        `Could not reconcile pending entry order status (${status || "unknown"}); inspect Alpaca before restarting`,
       );
     }
     state.position = null;
@@ -479,30 +467,23 @@ export async function runAutomaticOnce(
   const position = state.position;
   if (position && held !== position.quantity) {
     throw new Error(
-      `IBKR position is ${held} shares but automatic state tracks ${position.quantity}; reconcile manually before continuing`,
+      `Alpaca position is ${held} shares but automatic state tracks ${position.quantity}; reconcile manually before continuing`,
     );
   }
 
   if (position && exitSignal(indicators, index)) {
-    const quote = await getLiveQuote(baseUrl, contract.conid, "SELL");
+    const quote = await getQuote(symbol, "SELL");
     const exitOrder = {
-      conid: Number(contractId),
-      orderType: "LMT",
-      price: quote.bid,
-      side: "SELL",
-      tif: "DAY",
-      quantity: position.quantity,
-      outsideRTH: false,
+      symbol,
+      qty: String(position.quantity),
+      type: "limit",
+      limit_price: String(quote.bid),
+      side: "sell",
+      time_in_force: "day",
+      extended_hours: false,
     };
-    const payload = [exitOrder];
-    const preview = await request(
-      baseUrl,
-      `/iserver/account/${encodeURIComponent(account.id)}/orders/whatif`,
-      { method: "POST", body: JSON.stringify({ orders: payload }) },
-    );
-    const warning = checkPreview(preview);
-    if (warning)
-      return { symbol, bar: latest.date, action: "blocked", reason: warning };
+    const payload = exitOrder;
+    const preview = { order: exitOrder, quote };
     if (!submit)
       return {
         symbol,
@@ -514,8 +495,8 @@ export async function runAutomaticOnce(
       };
     state.inFlight = `${latest.date}:EXIT`;
     saveState(statePath, state);
-    await cancelStopAndConfirm(baseUrl, account.id, position.stopOrderId);
-    const brokerResponse = await submitPayload(baseUrl, account.id, payload);
+    await cancelStopAndConfirm(baseUrl, position.stopOrderId);
+    const brokerResponse = await submitPayload(baseUrl, payload);
     const items = Array.isArray(brokerResponse)
       ? brokerResponse
       : [brokerResponse];
@@ -526,13 +507,13 @@ export async function runAutomaticOnce(
       )
     ) {
       throw new Error(
-        `IBKR requires manual confirmation for the exit order; the protective stop is canceled. Inspect the account immediately: ${JSON.stringify(brokerResponse)}`,
+        `Alpaca rejected the exit order after the protective stop was canceled. Inspect the account immediately: ${JSON.stringify(brokerResponse)}`,
       );
     }
-    const exitOrderId = String(items[0]?.order_id || "");
+    const exitOrderId = String(items[0]?.id || "");
     if (!exitOrderId)
       throw new Error(
-        `IBKR returned no exit order ID and the protective stop is canceled; inspect the account immediately: ${JSON.stringify(brokerResponse)}`,
+        `Alpaca returned no exit order ID and the protective stop is canceled; inspect the account immediately: ${JSON.stringify(brokerResponse)}`,
       );
     state.exitOrderId = exitOrderId;
     state.inFlight = null;
@@ -549,7 +530,7 @@ export async function runAutomaticOnce(
   }
 
   if (position) {
-    const quote = await getLiveQuote(baseUrl, contract.conid, "SELL");
+    const quote = await getQuote(symbol, "SELL");
     const highestClose = Math.max(position.highestClose, latest.close);
     const currentAtr =
       atr ||
@@ -562,9 +543,9 @@ export async function runAutomaticOnce(
       state.inFlight = `${latest.date}:STOP_UPDATE`;
       saveState(statePath, state);
       try {
-        await updateStop(baseUrl, account.id, contractId, state, trailingStop);
+        await updateStop(baseUrl, state, trailingStop);
       } catch (error) {
-        // Keep the recovery marker: IBKR may have applied a modify request even if the response was lost.
+        // Keep the recovery marker: Alpaca may have applied a modify request even if the response was lost.
         throw error;
       }
     }
@@ -588,7 +569,7 @@ export async function runAutomaticOnce(
     return { symbol, bar: latest.date, action: "no entry signal", submit };
   }
 
-  const quote = await getLiveQuote(baseUrl, contract.conid, "BUY");
+  const quote = await getQuote(symbol, "BUY");
   const stopPrice = Number(
     (quote.ask - atr * config.atrStopMultiple).toFixed(2),
   );
@@ -616,37 +597,18 @@ export async function runAutomaticOnce(
         "Risk, allocation, or order-notional caps allow fewer than one share",
     };
 
-  const cOID = `auto-${symbol}-${Date.now()}`;
-  const bracket = [
-    {
-      conid: Number(contractId),
-      cOID,
-      orderType: "LMT",
-      price: quote.ask,
-      side: "BUY",
-      tif: "DAY",
-      quantity,
-      outsideRTH: false,
-    },
-    {
-      conid: Number(contractId),
-      orderType: "STP",
-      price: stopPrice,
-      side: "SELL",
-      tif: "GTC",
-      quantity,
-      outsideRTH: false,
-      parentId: cOID,
-    },
-  ];
-  const preview = await request(
-    baseUrl,
-    `/iserver/account/${encodeURIComponent(account.id)}/orders/whatif`,
-    { method: "POST", body: JSON.stringify({ orders: bracket }) },
-  );
-  const warning = checkPreview(preview);
-  if (warning)
-    return { symbol, bar: latest.date, action: "blocked", reason: warning };
+  const bracket = {
+    symbol,
+    qty: String(quantity),
+    side: "buy",
+    type: "limit",
+    time_in_force: "day",
+    limit_price: String(quote.ask),
+    order_class: "oto",
+    stop_loss: { stop_price: String(stopPrice) },
+    extended_hours: false,
+  };
+  const preview = { order: bracket, quote };
   if (!submit)
     return {
       symbol,
@@ -659,7 +621,7 @@ export async function runAutomaticOnce(
     };
   state.inFlight = `${latest.date}:ENTRY`;
   saveState(statePath, state);
-  const brokerResponse = await submitPayload(baseUrl, account.id, bracket);
+  const brokerResponse = await submitPayload(baseUrl, bracket);
   const items = Array.isArray(brokerResponse)
     ? brokerResponse
     : [brokerResponse];
@@ -669,23 +631,15 @@ export async function runAutomaticOnce(
     )
   ) {
     throw new Error(
-      `IBKR returned a warning or error for the automatic bracket; inspect broker response and open orders before restarting: ${JSON.stringify(brokerResponse)}`,
+      `Alpaca returned a warning or error for the automatic OTO order; inspect broker response and open orders before restarting: ${JSON.stringify(brokerResponse)}`,
     );
   }
-  const stopOrder = items.find(
-    (item: any) =>
-      item?.parent_order_id ||
-      (item?.order_id && String(item?.order_id) !== String(items[0]?.order_id)),
-  );
-  const stopOrderId = String(stopOrder?.order_id || "");
-  if (!stopOrderId)
-    throw new Error(
-      `IBKR accepted a response without a recognizable protective stop order ID; inspect open orders before restarting: ${JSON.stringify(brokerResponse)}`,
-    );
-  const parentOrderId = String(items[0]?.order_id || "");
+  const parentOrderId = String(items[0]?.id || "");
+  const fullOrder = parentOrderId ? await getOrder(baseUrl, parentOrderId) : items[0];
+  const stopOrderId = String(fullOrder?.legs?.[0]?.id || "");
   if (!parentOrderId)
     throw new Error(
-      `IBKR accepted the bracket but returned no parent order ID; inspect open orders before restarting: ${JSON.stringify(brokerResponse)}`,
+      `Alpaca accepted the OTO order but returned no parent order ID; inspect open orders before restarting: ${JSON.stringify(brokerResponse)}`,
     );
   state.position = {
     quantity,
@@ -707,5 +661,104 @@ export async function runAutomaticOnce(
     stopPrice,
     stopOrderId,
     brokerResponse,
+  };
+}
+
+export async function runAutonomousCycle(
+  options: AutonomousOptions,
+): Promise<Record<string, unknown>> {
+  if (options.config.assetClass !== "stock")
+    throw new Error("Autonomous Alpaca execution supports stock configs only");
+  const baseUrl = getBaseUrl();
+  const account = await getAccount(baseUrl);
+  if (options.submit && process.env.LIVE_TRADING_ENABLED !== "true")
+    throw new Error("Set LIVE_TRADING_ENABLED=true to enable the live-order kill switch");
+  if (options.submit && account.isPaper)
+    throw new Error("ALPACA_BASE_URL points to a paper account; live automatic trading stopped");
+  if (!Number.isFinite(account.equity) || account.equity <= 0)
+    throw new Error("Alpaca returned invalid account equity; no strategy action taken");
+
+  const dataDir = path.resolve(options.dataDir || "data");
+  const accountPositions = await getPositions(baseUrl);
+  const heldSymbols = accountPositions
+    .filter((position) => Number(position?.qty || 0) !== 0)
+    .map((position) => String(position.symbol || "").toUpperCase())
+    .filter((symbol) => /^[A-Z0-9.-]{1,16}$/.test(symbol));
+  const trackedSymbols = new Set<string>();
+  if (fs.existsSync(dataDir)) {
+    for (const name of fs.readdirSync(dataDir)) {
+      if (!/^auto-[A-Z0-9.-]+\.json$/i.test(name)) continue;
+      const state = JSON.parse(fs.readFileSync(path.join(dataDir, name), "utf8")) as AutoState;
+      if (state.accountId !== account.id) continue;
+      if (state.position || state.inFlight || state.exitOrderId)
+        trackedSymbols.add(state.symbol.toUpperCase());
+    }
+  }
+
+  // Reconcile and manage an existing bot position or pending action before scanning entries.
+  const managedSymbols = [...new Set([...heldSymbols, ...trackedSymbols])];
+  if (managedSymbols.length > 0) {
+    const decisions: Record<string, unknown>[] = [];
+    for (const symbol of managedSymbols) {
+      decisions.push(
+        await runAutomaticOnce({
+          symbol,
+          equity: account.equity,
+          config: options.config,
+          submit: options.submit,
+          dataDir,
+        }),
+      );
+    }
+    return {
+      action: "managed existing position or pending order; no new entry considered",
+      equity: account.equity,
+      decisions,
+    };
+  }
+
+  const openOrders = await getOpenOrders(baseUrl);
+  if (openOrders.length > 0)
+    return {
+      action: "waiting for account open orders; no new entry considered",
+      openOrderCount: openOrders.length,
+    };
+
+  const symbols = [...new Set((options.config.scanSymbols || [])
+    .map((symbol) => String(symbol).trim().toUpperCase())
+    .filter((symbol) => /^[A-Z0-9.-]{1,16}$/.test(symbol)))];
+  if (symbols.length === 0)
+    throw new Error("Add one or more candidate tickers to scanSymbols in the config file");
+
+  const decisions: Record<string, unknown>[] = [];
+  for (const symbol of symbols) {
+    try {
+      const decision = await runAutomaticOnce({
+        symbol,
+        equity: account.equity,
+        config: options.config,
+        submit: options.submit,
+        dataDir,
+      });
+      decisions.push(decision);
+      if (["preview entry bracket", "submitted entry bracket"].includes(String(decision.action)))
+        return {
+          action: options.submit ? "selected and submitted the highest-ranked qualifying candidate" : "selected the highest-ranked qualifying candidate (preview only)",
+          equity: account.equity,
+          candidatesScanned: decisions.length,
+          decisions,
+        };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (options.submit && /unknown|inspect|manual|inFlight|protective stop|reconcile/i.test(message))
+        throw error;
+      decisions.push({ symbol, action: "candidate skipped", reason: message });
+    }
+  }
+  return {
+    action: "no qualifying entry; chose not to trade",
+    equity: account.equity,
+    candidatesScanned: decisions.length,
+    decisions,
   };
 }

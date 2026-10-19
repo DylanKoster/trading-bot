@@ -25,7 +25,7 @@ function makeBars(): Bar[] {
 
 const config: BacktestConfig = {
   assetClass: 'stock',
-  platform: 'ibkr_nl_tiered',
+  platform: 'alpaca_us_equity',
   startingCapital: 10000,
   riskPerTrade: 0.01,
   maxPositionPct: 0.25,
@@ -40,16 +40,16 @@ test('CSV parser validates and sorts OHLC data', () => {
   assert.equal(bars[1].close, 2.5);
 });
 
-test('IBKR fee applies percentage and minimum', () => {
-  const profile = getFeeProfile('ibkr_nl_tiered');
-  assert.equal(transactionFee(1000, profile), 1.25);
-  assert.equal(transactionFee(10000, profile), 5);
+test('Alpaca US equity fee estimate is commission-free', () => {
+  const profile = getFeeProfile('alpaca_us_equity');
+  assert.equal(transactionFee(1000, profile), 0);
+  assert.equal(transactionFee(10000, profile), 0);
 });
 
 test('backtest reports fees and produces a finite result', () => {
   const report = backtest(makeBars(), config);
   assert.ok(Number.isFinite(report.finalEquity));
-  assert.ok(report.totalFees > 0);
+  assert.equal(report.totalFees, 0);
   assert.ok(report.trades > 0);
   assert.equal(report.startingCapital, 10000);
   assert.ok(Math.abs(report.tradeLog.reduce((sum, trade) => sum + trade.netPnl, 0) - report.netProfit) < 0.01);

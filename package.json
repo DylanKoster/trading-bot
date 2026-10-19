@@ -2,7 +2,7 @@
   "name": "nl-cost-aware-trading-bot",
   "version": "1.0.0",
   "private": true,
-  "description": "TypeScript fee-aware stock/crypto research bot with historical backtesting and guarded IBKR order entry.",
+  "description": "TypeScript fee-aware stock/crypto research bot with guarded Alpaca order entry.",
   "type": "commonjs",
   "scripts": {
     "build": "tsc -p tsconfig.json",

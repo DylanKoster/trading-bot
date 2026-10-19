@@ -1,14 +1,15 @@
 # Dutch fee-aware trading bot
 
-A TypeScript trading bot for historical backtesting and automatically generated, separately gated Interactive Brokers stock orders.
+A TypeScript research and trading bot with historical backtesting and guarded Alpaca stock order entry.
 
-This is not financial advice and it does not guarantee profit. Backtests remain offline. Live orders require a logged-in local IBKR Client Portal Gateway session, the live kill switch, and explicit command-line confirmation; the program does not store brokerage passwords or API credentials.
+This is not financial advice and it does not guarantee profit. Backtests remain offline. Broker access uses Alpaca API keys; live orders require the live kill switch, an Alpaca live endpoint, and explicit command-line confirmation.
 
 ## Requirements
 
 - Node.js 18 or newer
 - Run `npm install` to install the TypeScript build tools
 - A CSV with `date,open,high,low,close` and optional `volume`
+- Alpaca API credentials for order entry and market data
 
 There are no runtime dependencies; the TypeScript compiler and Node.js type declarations are development dependencies.
 
@@ -23,28 +24,27 @@ node dist/src/cli.js backtest --data path/to/daily.csv --config config/default.j
 node dist/src/cli.js backtest --data path/to/daily.csv --config config/default.json --json
 ```
 
-## IBKR order entry
+## Alpaca order entry
 
-This command sends one user-specified stock limit order per invocation. It does not run the strategy continuously or manage protective stops. It requires the IBKR Client Portal Gateway running locally, with a user-authenticated session and real-time market-data access. IBKR requires browser authentication for the gateway, and its session needs regular reauthentication; see [IBKR gateway setup](https://ibkrcampus.com/docs/web-api/authentication/cpgw/installation-authentication) and [API order documentation](https://ibkrcampus.com/docs/web-api/v1/endpoints/orders/place-order).
+The `place-order` command validates and sends one user-specified stock limit order per invocation. It does not run the strategy continuously or manage protective stops. The API defaults to Alpaca paper trading at `https://paper-api.alpaca.markets`; requests use Alpaca's Trading API and stock market data endpoints.
 
-Set the account and local gateway address in the shell. The gateway defaults to `https://localhost:5000/v1/api`:
+Set API credentials from your Alpaca account. Use paper credentials first:
 
 ```bash
-export IBKR_ACCOUNT_ID=U1234567
-export IBKR_BASE_URL=https://localhost:5000/v1/api
-# Set only if you have installed a trusted local certificate for the gateway:
-# export NODE_EXTRA_CA_CERTS=/path/to/gateway-ca.pem
+export ALPACA_API_KEY=your_key_id
+export ALPACA_SECRET_KEY=your_secret_key
 ```
 
-The first command below requests an IBKR what-if preview and never submits an order:
+Preview mode fetches the asset, account, and latest quote, checks the order limits, and prints the exact order payload. Alpaca does not provide the what-if endpoint used by the previous broker integration, so this is a local preview; it does not predict buying-power, regulatory, or broker-side order rejections.
 
 ```bash
 node dist/src/cli.js place-order --symbol AAPL --side BUY --quantity 1 --limit-price 200
 ```
 
-To submit, add `--live` and the exact order phrase. The account must be a live account; paper accounts are rejected for live submission.
+Live submission requires the live endpoint, the kill switch, `--live`, and the exact order phrase. Confirm live API access with Alpaca and change the endpoint only when ready:
 
 ```bash
+export ALPACA_BASE_URL=https://api.alpaca.markets
 export LIVE_TRADING_ENABLED=true
 node dist/src/cli.js place-order --symbol AAPL --side BUY --quantity 1 --limit-price 200 \
   --live --confirm-live-order "SUBMIT AAPL BUY 1 LMT 200"
@@ -53,39 +53,36 @@ node dist/src/cli.js place-order --symbol AAPL --side BUY --quantity 1 --limit-p
 Safety behavior:
 
 - Orders are single-stock, whole-share, regular-hours DAY limit orders. Market orders, crypto, short sales, and fractional shares are not supported.
-- Live submission also requires `LIVE_TRADING_ENABLED=true`; leave it unset for preview-only use.
-- The default maximum order value is 1,000 in the instrument's quote currency. Adjust it deliberately with `LIVE_MAX_ORDER_NOTIONAL` if needed.
-- If IBKR returns multiple matching stock contracts, pass the intended numeric contract ID with `--conid`.
-- The adapter checks for a real-time quote no older than 15 seconds and blocks delayed, frozen, or missing quotes.
-- IBKR's what-if preview runs before submission. If it returns a warning, the adapter stops. If the order endpoint asks for an additional confirmation, the adapter does not accept it automatically.
-- If the network fails during submission, check the IBKR order list before retrying; the broker may have received the order even when the client did not receive its response.
-- TLS certificate validation stays enabled. Configure the local gateway with a certificate trusted by Node.js if its default certificate is rejected; do not disable TLS verification.
-
-The adapter uses the local [IBKR Client Portal Gateway](https://ibkrcampus.com/docs/web-api/authentication/cpgw/limitations-of-the-client-portal-gateway). Keep it on localhost and do not expose the gateway port to a network.
+- The default maximum order value is 1,000 in the instrument's quote currency. Adjust it with `LIVE_MAX_ORDER_NOTIONAL` if needed.
+- The adapter checks for a valid latest IEX quote no older than 15 seconds and blocks missing or stale quotes.
+- Sells are checked against the current long position. Live submission to an endpoint identified as paper is blocked.
+- If the network fails during submission, inspect Alpaca's open orders before retrying; the broker may have received an order even when the client did not receive its response.
+- TLS certificate validation stays enabled.
 
 The included sample is deliberately small and synthetic. It is a smoke test for the engine, not evidence that the strategy makes money.
 
 ## Automatic strategy execution
 
-The `auto-trade` command evaluates the configured daily strategy against two years of IBKR daily bars. It ignores the current, still-forming candle, saves the retrieved bars to `data/<symbol>-ibkr-daily.csv`, and acts once per completed session. It defaults to preview-only. `--watch` keeps the process running and checks for a new session every five minutes. Run it while the local gateway is authenticated and during regular US market hours so DAY limit orders can be submitted promptly.
+The `auto-trade` command runs continuously and scans the `scanSymbols` candidate list in `config/default.json`. It evaluates each candidate with the configured daily strategy and selects the first candidate in that list with an entry signal; otherwise it chooses not to trade. The default list is an editable starter universe, not a recommendation. It ignores the current, still-forming daily candle, uses account equity for sizing, and manages at most one bot position at a time. It scans every five minutes by default and retries after temporary API errors. Press Ctrl+C to stop. This scanner uses the IEX bars and quotes already used by the bot; it does not call Alpaca's SIP-only most-active screener.
 
-Start with a preview; `--equity` is the sizing equity in the stock's quote currency (for example, USD for most US stocks):
+Start in preview mode. It does not submit orders:
 
 ```bash
-node dist/src/cli.js auto-trade --symbol AAPL --equity 10000 --config config/default.json
+node dist/src/cli.js auto-trade --config config/default.json
 ```
 
-To enable unattended live execution, leave the process running with the explicit live flag and symbol-specific confirmation. The live kill switch and order-notional cap still apply:
+Live automation requires `ALPACA_BASE_URL=https://api.alpaca.markets`, `LIVE_TRADING_ENABLED=true`, `--live`, and the explicit confirmation phrase:
 
 ```bash
+export ALPACA_BASE_URL=https://api.alpaca.markets
 export LIVE_TRADING_ENABLED=true
-node dist/src/cli.js auto-trade --symbol AAPL --equity 10000 --config config/default.json \
-  --watch --live --confirm-auto-trading "ENABLE AUTO TRADING AAPL"
+node dist/src/cli.js auto-trade --config config/default.json --interval-minutes 5 \
+  --live --confirm-auto-trading "ENABLE AUTONOMOUS AUTO TRADING"
 ```
 
-Automatic entries are whole-share DAY limit parent orders with an attached GTC ATR stop. Position size uses `riskPerTrade`, `maxPositionPct`, the ATR stop distance, the supplied equity, and `LIVE_MAX_ORDER_NOTIONAL` (default 1,000 in quote currency). Indicator exits cancel the attached stop and wait for IBKR to confirm cancellation before submitting a regular-hours DAY limit sell. A pending exit can leave the position without its stop until that sell fills, so check the printed exit status in IBKR. The runner will not manage positions it did not open, short positions, or ambiguous broker states. It persists order ownership and processed-bar state in `data/auto-<symbol>.json`; inspect IBKR orders and positions before clearing an `inFlight` marker after an interrupted or ambiguous API request.
+Automatic entries are whole-share DAY limit orders with an attached Alpaca OTO stop-loss order. Position size uses `riskPerTrade`, `maxPositionPct`, current account equity, the ATR stop distance, and `LIVE_MAX_ORDER_NOTIONAL` (default 1,000). The scanner will not add a new position while any account position or open order needs reconciliation. Indicator exits cancel the attached stop and wait for Alpaca to confirm cancellation before submitting a regular-hours DAY limit sell. A pending exit can leave the position without its stop until that sell fills, so check the account when an exit is pending. The runner will not manage positions it did not open, short positions, or ambiguous broker states. It persists order ownership and processed-bar state in `data/auto-<symbol>.json`; reconcile Alpaca orders and positions before clearing an `inFlight` marker after an interrupted or ambiguous API request.
 
-The runner requires about two years of daily history, a real-time quote, and a live IBKR account for submission. If IBKR returns a warning, it stops for manual review. See IBKR's [historical market data](https://ibkrcampus.com/docs/web-api/v1/endpoints/market-data/historical-market-data) and [bracket-order](https://ibkrcampus.com/docs/web-api/v1/endpoints/orders/bracket-orders-oca-groups) documentation.
+The runner requires about two years of daily history and a current quote. Alpaca's account permissions, market-data subscription, and asset availability determine whether a request can be served. Orders may be rejected or remain unfilled; preview mode cannot verify broker acceptance.
 
 ## Configure it
 
@@ -96,6 +93,7 @@ Copy `config/default.json` and change:
 - `startingCapital`: virtual starting cash in EUR
 - `riskPerTrade`: equity fraction at risk per position
 - `maxPositionPct`: maximum notional allocation
+- `scanSymbols`: candidate stock symbols the strategy may choose among
 - `atrStopMultiple`, `slippageBps`, and indicator periods
 - `allowFractionalShares`: set `true` for fractional stock sizing when the chosen venue and instrument support it
 
@@ -114,30 +112,16 @@ Example crypto config:
 }
 ```
 
-## Platform choice for a Dutch beginner
-
-The bot defaults to `ibkr_nl_tiered` for stocks because Interactive Brokers publishes a trading API and a Netherlands schedule with 0.05% tiered commission, €1.25 minimum, and €29 maximum per order at the first tier. For crypto, `kraken_spot_maker` and `kraken_spot_taker` model Kraken Pro's published entry-level spot fees of 0.40% maker and 0.80% taker; Kraken also publishes REST and WebSocket trading API documentation.
-
-Trade Republic advertises €1 settlement cost for a single trade and no monthly card fee, and DEGIRO's January 2026 Netherlands schedule shows €1–€2 headline stock fees plus a €1 handling cost depending on venue. Their low manual-trading costs do not make them the default bot venue here: a bot needs a supported, documented trading API and the actual spread/order-routing behavior must be verified before live use.
-
-Fee pages change. Re-check them before deploying:
-
-- [Interactive Brokers stock commissions](https://www.interactivebrokers.com/en/pricing/commissions-stocks.php)
-- [Kraken fee schedule](https://www.kraken.com/nl/features/fee-schedule)
-- [Kraken API documentation](https://docs.kraken.com/api/)
-- [Trade Republic Netherlands pricing](https://traderepublic.com/nl-nl)
-- [DEGIRO Netherlands fee PDF](https://www.degiro.nl/data/pdf/Tarievenoverzicht.pdf)
-
-The fee snapshots above were checked on 11 October 2026. They are not a substitute for the fee schedule shown in your account.
+The default stock fee profile estimates zero commission for Alpaca US equities. Actual fees and availability can depend on account, security, and regulatory charges. Kraken profiles model published Pro spot entry-tier fees; see [Kraken fees](https://www.kraken.com/nl/features/fee-schedule) and [Kraken API documentation](https://docs.kraken.com/api/).
 
 ## Strategy
 
-See [strategy.md](strategy.md) for the full custom strategy, sizing rules, exit logic, assumptions, and validation checklist. In brief, it is a long-only daily trend-pullback system using 10/30 EMA, RSI(14), ATR(14), next-open execution, a volatility stop, and fee-aware position sizing.
+See [strategy.md](strategy.md) for the custom strategy, sizing rules, exit logic, assumptions, and validation checklist. In brief, it is a long-only daily trend-pullback system using 10/30 EMA, RSI(14), ATR(14), next-open execution, a volatility stop, and fee-aware position sizing.
 
 ## Limitations and next steps
 
 - Use survivorship-bias-resistant symbol lists and adjusted data that handles splits and dividends.
 - Add a walk-forward/out-of-sample workflow before trusting parameters.
 - Add spread, exchange holiday, partial-fill, and currency-conversion models.
-- Automatic IBKR execution is daily-bar based and requires a continuously running local process for unattended operation; it does not guarantee fills or profit.
+- Automatic Alpaca execution is daily-bar based and requires a continuously running local process for unattended operation; it does not guarantee fills or profit.
 - Check Dutch tax obligations and instrument eligibility with a qualified adviser.
