@@ -1,0 +1,15 @@
+{
+  "accountId": "a8bb35fc-43bd-4b23-8bc5-58940737066f",
+  "symbol": "AAPL",
+  "assetId": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+  "lastProcessedBar": "2026-10-16",
+  "position": {
+    "quantity": 2,
+    "entryPrice": 341.96,
+    "stopPrice": 325.35,
+    "stopOrderId": "82627038-713e-451c-b462-aa0aeeb37754",
+    "parentOrderId": "42da4319-b96d-4e97-af4b-60d6e1674b9c",
+    "highestClose": 343.39
+  },
+  "inFlight": null
+}

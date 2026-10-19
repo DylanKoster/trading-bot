@@ -35,12 +35,14 @@ export interface AutoOptions {
   equity: number;
   config: AutoConfig;
   submit: boolean;
+  allowPaper?: boolean;
   dataDir?: string;
 }
 
 export interface AutonomousOptions {
   config: AutoConfig;
   submit: boolean;
+  allowPaper?: boolean;
   dataDir?: string;
 }
 
@@ -271,23 +273,25 @@ async function cancelStopAndConfirm(
 export async function runAutomaticOnce(
   options: AutoOptions,
 ): Promise<Record<string, unknown>> {
-  const { symbol, equity, config, submit } = options;
+  const { symbol, equity, config, submit, allowPaper = false } = options;
   if (config.assetClass !== "stock")
     throw new Error("Automatic Alpaca execution supports stock configs only");
   if (!Number.isFinite(equity) || equity <= 0)
     throw new Error(
       "--equity must be a positive amount in the stock contract currency",
     );
-  if (submit && process.env.LIVE_TRADING_ENABLED !== "true")
+  if (submit && !allowPaper && process.env.LIVE_TRADING_ENABLED !== "true")
     throw new Error(
       "Set LIVE_TRADING_ENABLED=true to enable the live-order kill switch",
     );
   const baseUrl = getBaseUrl();
   const account = await getAccount(baseUrl);
-  if (submit && account.isPaper)
+  if (submit && account.isPaper && !allowPaper)
     throw new Error(
       "ALPACA_BASE_URL points to a paper account; live automatic trading stopped",
     );
+  if (submit && !account.isPaper && allowPaper)
+    throw new Error("Paper mode requires ALPACA_BASE_URL=https://paper-api.alpaca.markets");
   const contract = await getStockContract(baseUrl, symbol);
   const assetId = String(contract.assetId);
   const bars = await getDailyHistory(symbol);
@@ -671,10 +675,12 @@ export async function runAutonomousCycle(
     throw new Error("Autonomous Alpaca execution supports stock configs only");
   const baseUrl = getBaseUrl();
   const account = await getAccount(baseUrl);
-  if (options.submit && process.env.LIVE_TRADING_ENABLED !== "true")
+  if (options.submit && !options.allowPaper && process.env.LIVE_TRADING_ENABLED !== "true")
     throw new Error("Set LIVE_TRADING_ENABLED=true to enable the live-order kill switch");
-  if (options.submit && account.isPaper)
+  if (options.submit && account.isPaper && !options.allowPaper)
     throw new Error("ALPACA_BASE_URL points to a paper account; live automatic trading stopped");
+  if (options.submit && !account.isPaper && options.allowPaper)
+    throw new Error("Paper mode requires ALPACA_BASE_URL=https://paper-api.alpaca.markets");
   if (!Number.isFinite(account.equity) || account.equity <= 0)
     throw new Error("Alpaca returned invalid account equity; no strategy action taken");
 
@@ -706,6 +712,7 @@ export async function runAutonomousCycle(
           equity: account.equity,
           config: options.config,
           submit: options.submit,
+          allowPaper: options.allowPaper,
           dataDir,
         }),
       );
@@ -738,6 +745,7 @@ export async function runAutonomousCycle(
         equity: account.equity,
         config: options.config,
         submit: options.submit,
+        allowPaper: options.allowPaper,
         dataDir,
       });
       decisions.push(decision);

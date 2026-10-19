@@ -123,6 +123,10 @@ async function main(): Promise<void> {
       throw new Error("auto-trade scans the market automatically; --symbol and --equity are not accepted");
     if (args.live && args.live !== true)
       throw new Error("--live is a flag and takes no value");
+    if (args.paper && args.paper !== true)
+      throw new Error("--paper is a flag and takes no value");
+    if (args.live && args.paper)
+      throw new Error("Choose either --paper or --live, not both");
     const intervalMinutes = Number(stringArg(args, "interval-minutes") || 5);
     if (!Number.isFinite(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 60)
       throw new Error("--interval-minutes must be between 1 and 60");
@@ -132,12 +136,22 @@ async function main(): Promise<void> {
         'Live automation requires --confirm-auto-trading "ENABLE AUTONOMOUS AUTO TRADING"',
       );
     }
+    if (args.paper && confirmation !== "ENABLE PAPER AUTO TRADING") {
+      throw new Error(
+        'Paper automation requires --confirm-auto-trading "ENABLE PAPER AUTO TRADING"',
+      );
+    }
     if (!args.live && confirmation)
-      throw new Error("--confirm-auto-trading requires --live");
-    console.log(`Autonomous scanner running every ${intervalMinutes} minute(s); press Ctrl+C to stop.`);
+      if (!args.paper) throw new Error("--confirm-auto-trading requires --paper or --live");
+    const mode = args.live ? "live" : args.paper ? "paper" : "preview";
+    console.log(`Autonomous scanner running in ${mode} mode every ${intervalMinutes} minute(s); press Ctrl+C to stop.`);
     while (true) {
       try {
-        const result = await runAutonomousCycle({ config, submit: args.live === true });
+        const result = await runAutonomousCycle({
+          config,
+          submit: args.live === true || args.paper === true,
+          allowPaper: args.paper === true,
+        });
         console.log(JSON.stringify({ at: new Date().toISOString(), ...result }, null, 2));
       } catch (error) {
         console.error(
@@ -149,7 +163,7 @@ async function main(): Promise<void> {
   }
   if (command !== "backtest") {
     console.error(
-      'Usage:\n  node dist/src/cli.js backtest --data data/file.csv --config config/default.json [--json]\n  node dist/src/cli.js place-order --symbol AAPL --side BUY --quantity 1 --limit-price 200 [--live --confirm-live-order "SUBMIT AAPL BUY 1 LMT 200"]\n  node dist/src/cli.js auto-trade --config config/default.json [--interval-minutes 5] [--live --confirm-auto-trading "ENABLE AUTONOMOUS AUTO TRADING"]',
+      'Usage:\n  node dist/src/cli.js backtest --data data/file.csv --config config/default.json [--json]\n  node dist/src/cli.js place-order --symbol AAPL --side BUY --quantity 1 --limit-price 200 [--live --confirm-live-order "SUBMIT AAPL BUY 1 LMT 200"]\n  node dist/src/cli.js auto-trade --config config/default.json [--interval-minutes 5] [--paper --confirm-auto-trading "ENABLE PAPER AUTO TRADING" | --live --confirm-auto-trading "ENABLE AUTONOMOUS AUTO TRADING"]',
     );
     process.exitCode = 1;
     return;

@@ -65,13 +65,24 @@ The included sample is deliberately small and synthetic. It is a smoke test for 
 
 The `auto-trade` command runs continuously and scans the `scanSymbols` candidate list in `config/default.json`. It evaluates each candidate with the configured daily strategy and selects the first candidate in that list with an entry signal; otherwise it chooses not to trade. The default list is an editable starter universe, not a recommendation. It ignores the current, still-forming daily candle, uses account equity for sizing, and manages at most one bot position at a time. It scans every five minutes by default and retries after temporary API errors. Press Ctrl+C to stop. This scanner uses the IEX bars and quotes already used by the bot; it does not call Alpaca's SIP-only most-active screener.
 
-Start in preview mode. It does not submit orders:
+Preview mode does not submit orders:
 
 ```bash
 node dist/src/cli.js auto-trade --config config/default.json
 ```
 
-Live automation requires `ALPACA_BASE_URL=https://api.alpaca.markets`, `LIVE_TRADING_ENABLED=true`, `--live`, and the explicit confirmation phrase:
+To submit orders to Alpaca paper trading, load your paper credentials and explicitly confirm paper mode. Alpaca uses separate paper and live credentials and API domains. [Alpaca authentication docs](https://docs.alpaca.markets/us/v1.1/docs/authentication-1)
+
+```bash
+set -a
+. ./.env
+set +a
+export ALPACA_BASE_URL=https://paper-api.alpaca.markets
+node dist/src/cli.js auto-trade --config config/default.json --paper \
+  --confirm-auto-trading "ENABLE PAPER AUTO TRADING"
+```
+
+Live automation remains separately gated by `ALPACA_BASE_URL=https://api.alpaca.markets`, `LIVE_TRADING_ENABLED=true`, `--live`, and the explicit confirmation phrase:
 
 ```bash
 export ALPACA_BASE_URL=https://api.alpaca.markets
