@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   getAccount,
   getBaseUrl,
@@ -58,8 +59,8 @@ interface AutoPosition {
   quantity: number;
   entryPrice: number;
   stopPrice: number;
-  stopOrderId: string;
-  parentOrderId: string;
+  stopOrderId: string | null;
+  parentOrderId: string | null;
   highestClose: number;
 }
 
@@ -70,10 +71,50 @@ interface AutoState {
   lastProcessedBar: string | null;
   position: AutoPosition | null;
   inFlight: string | null;
+  pendingStopOrderClientId?: string | null;
   exitOrderId?: string | null;
 }
 
 const NEW_YORK_TZ = "America/New_York";
+// Renew before Alpaca's aged GTC order policy reaches its 90-day expiry.
+const GTC_STOP_RENEWAL_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+const ACTIVE_ORDER_STATUSES = new Set([
+  "new",
+  "accepted",
+  "pending_new",
+  "partially_filled",
+  "submitted",
+  "presubmitted",
+  "pending_submit",
+  "pending submit",
+  "partially filled",
+  "pending",
+]);
+
+function orderStatus(order: any): string {
+  return String(order?.status || "").toLowerCase();
+}
+
+function isActiveOrderStatus(status: string): boolean {
+  return ACTIVE_ORDER_STATUSES.has(status);
+}
+
+function orderQuantity(order: any): number {
+  return Math.abs(Number(order?.qty || order?.quantity || 0));
+}
+
+function orderStopPrice(order: any): number {
+  return Number(order?.stop_price || order?.stopPrice || 0);
+}
+
+function orderType(order: any): string {
+  return String(order?.type || order?.order_type || "").toLowerCase();
+}
+
+function orderSide(order: any): string {
+  return String(order?.side || "").toLowerCase();
+}
 
 function newYorkDate(timestamp: number): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -241,11 +282,6 @@ async function getDailyHistory(
   return uniqueBars;
 }
 
-async function getPosition(baseUrl: string, symbol: string): Promise<number> {
-  const position = await fetchPosition(baseUrl, symbol);
-  return Number(position?.qty || 0);
-}
-
 async function submitPayload(
   baseUrl: string,
   payload: Record<string, unknown>,
@@ -266,14 +302,33 @@ async function submitPayload(
   }
 }
 
+async function getOrderByClientOrderId(
+  baseUrl: string,
+  clientOrderId: string,
+): Promise<any | null> {
+  try {
+    return await request(
+      baseUrl,
+      `/v2/orders:by_client_order_id?client_order_id=${encodeURIComponent(clientOrderId)}`,
+    );
+  } catch (error) {
+    if (error instanceof Error && /Alpaca request failed \(404\)/.test(error.message))
+      return null;
+    throw error;
+  }
+}
+
 async function updateStop(
   baseUrl: string,
   state: AutoState,
   nextStop: number,
+  force = false,
 ): Promise<void> {
   const position = state.position;
-  if (!position || nextStop <= position.stopPrice || nextStop <= 0) return;
-  await cancelStopAndConfirm(baseUrl, position.stopOrderId);
+  if (!position || nextStop <= 0 || (!force && nextStop <= position.stopPrice)) return;
+  if (position.stopOrderId)
+    await cancelStopAndConfirm(baseUrl, position.stopOrderId);
+  const stopPrice = Number(nextStop.toFixed(2));
   const result = await request(baseUrl, "/v2/orders", {
     method: "POST",
     body: JSON.stringify({
@@ -282,7 +337,8 @@ async function updateStop(
       side: "sell",
       type: "stop",
       time_in_force: "gtc",
-      stop_price: String(Number(nextStop.toFixed(2))),
+      stop_price: String(stopPrice),
+      client_order_id: state.pendingStopOrderClientId || undefined,
     }),
   });
   if (!result?.id)
@@ -290,18 +346,30 @@ async function updateStop(
       `Alpaca returned no replacement stop order ID. Protective stop update needs manual review: ${JSON.stringify(result)}`,
     );
   position.stopOrderId = String(result.id);
-  position.stopPrice = Number(nextStop.toFixed(2));
+  position.stopPrice = stopPrice;
 }
 
 async function cancelStopAndConfirm(
   baseUrl: string,
   orderId: string,
 ): Promise<void> {
-  await request(
-    baseUrl,
-    `/v2/orders/${encodeURIComponent(orderId)}`,
-    { method: "DELETE" },
-  );
+  const existing = await getOrder(baseUrl, orderId);
+  const existingStatus = orderStatus(existing);
+  if (["cancelled", "canceled", "expired"].includes(existingStatus)) return;
+  if (existingStatus === "filled")
+    throw new Error(
+      "Protective stop filled while the strategy action was starting; inspect the account before continuing",
+    );
+  if (existingStatus === "inactive")
+    throw new Error(
+      "Protective stop became inactive; inspect the account before continuing",
+    );
+  if (existingStatus !== "pending_cancel")
+    await request(
+      baseUrl,
+      `/v2/orders/${encodeURIComponent(orderId)}`,
+      { method: "DELETE" },
+    );
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     const status = await request(
@@ -311,7 +379,7 @@ async function cancelStopAndConfirm(
     const value = String(
       status?.status || "",
     ).toLowerCase();
-    if (["cancelled", "canceled", "filled", "inactive"].includes(value)) {
+    if (["cancelled", "canceled", "expired", "filled", "inactive"].includes(value)) {
       if (value === "filled")
         throw new Error(
           "Protective stop filled while the strategy exit was starting; inspect the account before restarting",
@@ -326,6 +394,128 @@ async function cancelStopAndConfirm(
   throw new Error(
     "Alpaca has not confirmed cancellation of the protective stop; strategy exit was not submitted",
   );
+}
+
+async function recoverStopUpdate(
+  baseUrl: string,
+  state: AutoState,
+  held: number,
+): Promise<boolean> {
+  if (!state.inFlight) return false;
+  const position = state.position;
+  if (!state.inFlight.endsWith(":STOP_UPDATE") || !position)
+    throw new Error(
+      `Previous automatic action ${state.inFlight} has an unknown or incomplete outcome; reconcile Alpaca orders and positions before continuing`,
+    );
+  if (held !== position.quantity)
+    throw new Error(
+      `Alpaca position is ${held} shares while a stop update is unresolved for ${position.quantity}; reconcile the position and orders before continuing`,
+    );
+
+  if (state.pendingStopOrderClientId) {
+    const submittedStop = await getOrderByClientOrderId(
+      baseUrl,
+      state.pendingStopOrderClientId,
+    );
+    if (submittedStop) {
+      const status = orderStatus(submittedStop);
+      if (status === "pending_cancel")
+        throw new Error(
+          `The replacement ${state.symbol} stop is pending cancellation; the scanner will reconcile it on the next cycle`,
+        );
+      if (isActiveOrderStatus(status)) {
+        const stopPrice = orderStopPrice(submittedStop);
+        const stopOrderId = String(submittedStop?.id || "");
+        if (
+          String(submittedStop?.symbol || "").toUpperCase() !== state.symbol.toUpperCase() ||
+          orderSide(submittedStop) !== "sell" ||
+          orderType(submittedStop) !== "stop" ||
+          orderQuantity(submittedStop) !== held ||
+          !stopOrderId ||
+          !Number.isFinite(stopPrice) ||
+          stopPrice <= 0
+        )
+          throw new Error(
+            `The submitted replacement stop for ${state.symbol} does not match the held position; inspect Alpaca before continuing`,
+          );
+        const currentSellOrders = (await getOpenOrders(baseUrl)).filter(
+          (order: any) => String(order?.symbol || "").toUpperCase() === state.symbol.toUpperCase() && orderSide(order) === "sell",
+        );
+        if (
+          currentSellOrders.length > 1 ||
+          currentSellOrders.some((order: any) => String(order?.id || "") !== stopOrderId)
+        )
+          throw new Error(
+            `The ${state.symbol} replacement stop exists alongside another open sell order; reconcile the orders before continuing`,
+          );
+        position.stopOrderId = stopOrderId;
+        position.stopPrice = stopPrice;
+        state.pendingStopOrderClientId = null;
+        state.inFlight = null;
+        return false;
+      }
+      if (["filled", "expired", "cancelled", "canceled"].includes(status)) {
+        if (status === "filled")
+          throw new Error(
+            `Alpaca reports the replacement ${state.symbol} stop filled but still reports ${held} shares; reconcile before continuing`,
+          );
+        state.pendingStopOrderClientId = null;
+      } else {
+        throw new Error(
+          `The replacement ${state.symbol} stop has status ${status || "unknown"}; inspect Alpaca before continuing`,
+        );
+      }
+    }
+  }
+
+  const openOrders = await getOpenOrders(baseUrl);
+  const sellOrders = openOrders.filter(
+    (order: any) => String(order?.symbol || "").toUpperCase() === state.symbol.toUpperCase() && orderSide(order) === "sell",
+  );
+  const stopOrders = sellOrders.filter((order: any) => orderType(order) === "stop");
+  if (sellOrders.length !== stopOrders.length || stopOrders.length > 1)
+    throw new Error(
+      `Stop recovery for ${state.symbol} found multiple or conflicting open sell orders; reconcile them manually before continuing`,
+    );
+
+  if (stopOrders.length === 1) {
+    const activeStop = stopOrders[0];
+    const activeStatus = orderStatus(activeStop);
+    if (activeStatus === "pending_cancel")
+      throw new Error(
+        `The ${state.symbol} protective stop is still pending cancellation; the scanner will reconcile it on the next cycle`,
+      );
+    if (!isActiveOrderStatus(activeStatus))
+      throw new Error(
+        `The open ${state.symbol} stop has status ${activeStatus || "unknown"}; inspect Alpaca before continuing`,
+      );
+    const stopPrice = orderStopPrice(activeStop);
+    if (orderQuantity(activeStop) !== held || !Number.isFinite(stopPrice) || stopPrice <= 0)
+      throw new Error(
+        `Open ${state.symbol} stop order does not match the held quantity or has an invalid stop price; reconcile manually before continuing`,
+      );
+    position.stopOrderId = String(activeStop.id || "");
+    if (!position.stopOrderId)
+      throw new Error(`Alpaca returned an open ${state.symbol} stop without an order ID`);
+    position.stopPrice = stopPrice;
+    state.pendingStopOrderClientId = null;
+    state.inFlight = null;
+    return false;
+  }
+
+  if (position.stopOrderId) {
+    const oldStop = await getOrder(baseUrl, position.stopOrderId);
+    const status = orderStatus(oldStop);
+    if (!["expired", "cancelled", "canceled"].includes(status))
+      throw new Error(
+        `The ${state.symbol} stop update is unresolved and no active replacement stop was found (old stop status: ${status || "unknown"}); inspect Alpaca before continuing`,
+      );
+  }
+
+  // The old stop is confirmed terminal and no replacement is open. The position
+  // manager will submit a replacement stop using the saved trailing level.
+  state.inFlight = null;
+  return true;
 }
 
 export async function runAutomaticOnce(
@@ -373,11 +563,11 @@ export async function runAutomaticOnce(
   const atr = indicators.atr[index];
   const statePath = path.join(dataDir, `auto-${symbol.toLowerCase()}.json`);
   const state = loadState(statePath, account.id, symbol, assetId);
-  if (state.inFlight)
-    throw new Error(
-      `Previous automatic action ${state.inFlight} has an unknown or incomplete outcome; reconcile Alpaca orders and positions, then clear the state marker manually`,
-    );
-  const held = await getPosition(baseUrl, symbol);
+  const brokerPosition = await fetchPosition(baseUrl, symbol);
+  const held = Number(brokerPosition?.qty || 0);
+  const hadInFlight = Boolean(state.inFlight);
+  let forceStopReplacement = await recoverStopUpdate(baseUrl, state, held);
+  if (hadInFlight) saveState(statePath, state);
   if (state.exitOrderId) {
     const exitOrderId = state.exitOrderId;
     const exitStatus = await getOrder(baseUrl, exitOrderId);
@@ -425,23 +615,21 @@ export async function runAutomaticOnce(
       `Indicator exit order is ${status || "in an unknown state"} and its protective stop was canceled; inspect Alpaca and manage the position manually`,
     );
   }
-  if (held > 0 && !state.position)
-    throw new Error(
-      `Alpaca holds ${held} ${symbol} shares, but this runner has no ownership state; refusing to manage an untracked position`,
-    );
   if (held < 0)
     throw new Error(
       `Alpaca reports a short ${symbol} position; this long-only runner will not manage it`,
     );
-  if (state.position && !state.position.stopOrderId) {
-    const parentOrder = await getOrder(baseUrl, state.position.parentOrderId);
-    const parentStatus = String(parentOrder?.status || "").toLowerCase();
-    if (["new", "accepted", "pending_new", "partially_filled"].includes(parentStatus))
+  const pendingPosition = state.position;
+  if (pendingPosition && !pendingPosition.stopOrderId && pendingPosition.parentOrderId) {
+    const parentOrderId = pendingPosition.parentOrderId;
+    const parentOrder = await getOrder(baseUrl, parentOrderId);
+    const parentStatus = orderStatus(parentOrder);
+    if (isActiveOrderStatus(parentStatus))
       return {
         symbol,
         bar: latest.date,
         action: "entry order awaiting fill",
-        orderId: state.position.parentOrderId,
+        orderId: parentOrderId,
         status: parentStatus,
       };
     if (parentStatus === "filled") {
@@ -450,9 +638,16 @@ export async function runAutomaticOnce(
         throw new Error(
           "Alpaca reports the entry filled but returned no attached stop order; inspect open orders and protect the position manually",
         );
-      state.position.stopOrderId = stopOrderId;
+      pendingPosition.stopOrderId = stopOrderId;
+      pendingPosition.stopPrice = Number(
+        parentOrder?.legs?.[0]?.stop_price || pendingPosition.stopPrice,
+      );
       saveState(statePath, state);
     } else if (["canceled", "cancelled", "rejected", "expired"].includes(parentStatus)) {
+      if (held > 0)
+        throw new Error(
+          `Alpaca holds ${held} ${symbol} shares but the saved entry order is ${parentStatus}; reconcile ownership and protective orders manually`,
+        );
       state.position = null;
       state.lastProcessedBar = latest.date;
       saveState(statePath, state);
@@ -462,13 +657,14 @@ export async function runAutomaticOnce(
       );
     }
   }
-  if (state.position && held === 0) {
-    const stopStatus = await getOrder(baseUrl, state.position.stopOrderId);
-    const stopState = String(
-      stopStatus?.status || "",
-    ).toLowerCase();
+  const closedPosition = state.position;
+  if (closedPosition && held === 0) {
+    const stopStatus = closedPosition.stopOrderId
+      ? await getOrder(baseUrl, closedPosition.stopOrderId)
+      : null;
+    const stopState = orderStatus(stopStatus);
     if (stopState === "filled") {
-      const stopOrderId = state.position.stopOrderId;
+      const stopOrderId = closedPosition.stopOrderId;
       state.position = null;
       state.lastProcessedBar = latest.date;
       saveState(statePath, state);
@@ -479,28 +675,34 @@ export async function runAutomaticOnce(
         stopOrderId,
       };
     }
-    const parentStatus = await getOrder(baseUrl, state.position.parentOrderId);
-    const status = String(
-      parentStatus?.status || "",
-    ).toLowerCase();
-    if (
-      [
-        "new",
-        "accepted",
-        "pending_new",
-        "partially_filled",
-        "submitted",
-        "presubmitted",
-        "pending submit",
-        "partially filled",
-        "pending",
-      ].includes(status)
-    ) {
+    if (isActiveOrderStatus(stopState) && closedPosition.stopOrderId)
+      await cancelStopAndConfirm(baseUrl, closedPosition.stopOrderId);
+    else if (
+      stopState &&
+      !["expired", "cancelled", "canceled", "inactive"].includes(stopState)
+    )
+      throw new Error(
+        `Could not reconcile protective stop status (${stopState}); inspect Alpaca before continuing`,
+      );
+    const parentOrderId = closedPosition.parentOrderId;
+    if (!parentOrderId) {
+      state.position = null;
+      state.lastProcessedBar = latest.date;
+      saveState(statePath, state);
+      return {
+        symbol,
+        bar: latest.date,
+        action: "adopted position is no longer held",
+      };
+    }
+    const parentStatus = await getOrder(baseUrl, parentOrderId);
+    const status = orderStatus(parentStatus);
+    if (isActiveOrderStatus(status)) {
       return {
         symbol,
         bar: latest.date,
         action: "entry order awaiting fill",
-        orderId: state.position.parentOrderId,
+        orderId: parentOrderId,
         status,
       };
     }
@@ -508,7 +710,7 @@ export async function runAutomaticOnce(
       throw new Error(
         "Alpaca says the entry filled but the position endpoint is flat; reconcile account positions before restarting",
       );
-    if (!["cancelled", "canceled", "inactive"].includes(status)) {
+    if (!["cancelled", "canceled", "inactive", "expired"].includes(status)) {
       throw new Error(
         `Could not reconcile pending entry order status (${status || "unknown"}); inspect Alpaca before restarting`,
       );
@@ -516,7 +718,7 @@ export async function runAutomaticOnce(
     state.position = null;
     state.lastProcessedBar = latest.date;
   }
-  if (state.lastProcessedBar === latest.date)
+  if (held === 0 && !state.position && state.lastProcessedBar === latest.date)
     return { symbol, bar: latest.date, action: "already processed", submit };
   if (submit && !isRegularSession())
     return {
@@ -526,6 +728,111 @@ export async function runAutomaticOnce(
       submit,
     };
 
+  if (held > 0 && !state.position) {
+    if (!Number.isInteger(held))
+      throw new Error(
+        `Alpaca holds a fractional ${symbol} position (${held}); automatic adoption currently requires whole shares`,
+      );
+    const openOrders = await getOpenOrders(baseUrl);
+    const symbolOrders = openOrders.filter(
+      (order: any) => String(order?.symbol || "").toUpperCase() === symbol.toUpperCase(),
+    );
+    if (symbolOrders.some((order: any) => orderSide(order) === "buy"))
+      throw new Error(`Cannot adopt ${symbol} while an open buy order can change its position quantity`);
+    const sellOrders = symbolOrders.filter((order: any) => orderSide(order) === "sell");
+    const stopOrders = sellOrders.filter((order: any) => orderType(order) === "stop");
+    if (sellOrders.length !== stopOrders.length || stopOrders.length > 1)
+      throw new Error(
+        `Cannot adopt ${symbol}: multiple or conflicting open sell orders need manual reconciliation`,
+      );
+    const entryPrice = Number(brokerPosition?.avg_entry_price || 0);
+    if (!Number.isFinite(entryPrice) || entryPrice <= 0)
+      throw new Error(`Alpaca returned no valid average entry price for ${symbol}; cannot adopt the position`);
+
+    if (stopOrders.length === 1) {
+      const stopOrder = stopOrders[0];
+      const status = orderStatus(stopOrder);
+      const stopPrice = orderStopPrice(stopOrder);
+      const stopOrderId = String(stopOrder?.id || "");
+      if (
+        !isActiveOrderStatus(status) ||
+        orderQuantity(stopOrder) !== held ||
+        !stopOrderId ||
+        !Number.isFinite(stopPrice) ||
+        stopPrice <= 0
+      )
+        throw new Error(
+          `Cannot adopt ${symbol}: its open sell stop does not match the held quantity or has invalid details`,
+        );
+      state.position = {
+        quantity: held,
+        entryPrice,
+        stopPrice,
+        stopOrderId,
+        parentOrderId: null,
+        // Start the trailing watermark at adoption; the original holding date is unknown.
+        highestClose: latest.close,
+      };
+      if (submit) saveState(statePath, state);
+    } else {
+      if (typeof atr !== "number" || !Number.isFinite(atr) || atr <= 0)
+        throw new Error(`Cannot adopt ${symbol} without a valid ATR for its initial protective stop`);
+      const quote = await getQuote(symbol, "SELL");
+      const highestClose = Math.max(entryPrice, latest.close);
+      const stopPrice = Number(
+        Math.max(
+          entryPrice - atr * config.atrStopMultiple,
+          highestClose - atr * config.atrStopMultiple,
+        ).toFixed(2),
+      );
+      if (stopPrice <= 0 || stopPrice >= quote.bid)
+        throw new Error(
+          `Cannot safely place an initial ${symbol} stop at ${stopPrice}; current bid is ${quote.bid}. Review this holding manually`,
+        );
+      const adoptedPosition: AutoPosition = {
+        quantity: held,
+        entryPrice,
+        stopPrice,
+        stopOrderId: null,
+        parentOrderId: null,
+        highestClose,
+      };
+      state.position = adoptedPosition;
+      const order = {
+        symbol,
+        qty: String(held),
+        side: "sell",
+        type: "stop",
+        time_in_force: "gtc",
+        stop_price: String(stopPrice),
+      };
+      if (!submit)
+        return {
+          symbol,
+          bar: latest.date,
+          action: "preview adoption of existing position",
+          quantity: held,
+          stopPrice,
+          preview: { order, quote },
+        };
+      state.inFlight = `${latest.date}:STOP_UPDATE`;
+      state.pendingStopOrderClientId ||= `auto-stop-${symbol.toLowerCase()}-${randomUUID()}`;
+      saveState(statePath, state);
+      await updateStop(baseUrl, state, stopPrice, true);
+      state.inFlight = null;
+      state.pendingStopOrderClientId = null;
+      saveState(statePath, state);
+      return {
+        symbol,
+        bar: latest.date,
+        action: "adopted existing position and placed protective stop",
+        quantity: held,
+        stopPrice,
+        stopOrderId: adoptedPosition.stopOrderId,
+      };
+    }
+  }
+
   const position = state.position;
   if (position && held !== position.quantity) {
     throw new Error(
@@ -533,94 +840,167 @@ export async function runAutomaticOnce(
     );
   }
 
-  if (position && exitSignal(indicators, index)) {
-    const quote = await getQuote(symbol, "SELL");
-    const exitOrder = {
-      symbol,
-      qty: String(position.quantity),
-      type: "limit",
-      limit_price: String(quote.bid),
-      side: "sell",
-      time_in_force: "day",
-      extended_hours: false,
-    };
-    const payload = exitOrder;
-    const preview = { order: exitOrder, quote };
-    if (!submit)
-      return {
-        symbol,
-        bar: latest.date,
-        action: "preview indicator exit",
-        quantity: position.quantity,
-        limitPrice: quote.bid,
-        preview,
-      };
-    state.inFlight = `${latest.date}:EXIT`;
-    saveState(statePath, state);
-    await cancelStopAndConfirm(baseUrl, position.stopOrderId);
-    const brokerResponse = await submitPayload(baseUrl, payload);
-    const items = Array.isArray(brokerResponse)
-      ? brokerResponse
-      : [brokerResponse];
-    if (
-      items.some(
-        (item: any) =>
-          item?.error || (item?.id && Array.isArray(item?.message)),
-      )
-    ) {
-      throw new Error(
-        `Alpaca rejected the exit order after the protective stop was canceled. Inspect the account immediately: ${JSON.stringify(brokerResponse)}`,
-      );
-    }
-    const exitOrderId = String(items[0]?.id || "");
-    if (!exitOrderId)
-      throw new Error(
-        `Alpaca returned no exit order ID and the protective stop is canceled; inspect the account immediately: ${JSON.stringify(brokerResponse)}`,
-      );
-    state.exitOrderId = exitOrderId;
-    state.inFlight = null;
-    state.lastProcessedBar = latest.date;
-    saveState(statePath, state);
-    return {
-      symbol,
-      bar: latest.date,
-      action: "submitted indicator exit",
-      quantity: position.quantity,
-      limitPrice: quote.bid,
-      exitOrderId,
-    };
-  }
-
   if (position) {
+    let renewStop = forceStopReplacement || !position.stopOrderId;
+    if (position.stopOrderId) {
+      const existingStop = await getOrder(baseUrl, position.stopOrderId);
+      const status = orderStatus(existingStop);
+      if (["expired", "cancelled", "canceled"].includes(status)) {
+        renewStop = true;
+      } else if (status === "filled") {
+        throw new Error(
+          `Alpaca reports the ${symbol} protective stop filled but still reports ${held} shares; reconcile the position before continuing`,
+        );
+      } else if (isActiveOrderStatus(status)) {
+        const actualStopPrice = orderStopPrice(existingStop);
+        if (
+          String(existingStop?.symbol || "").toUpperCase() !== symbol.toUpperCase() ||
+          orderSide(existingStop) !== "sell" ||
+          orderType(existingStop) !== "stop" ||
+          orderQuantity(existingStop) !== held ||
+          !Number.isFinite(actualStopPrice) ||
+          actualStopPrice <= 0
+        )
+          throw new Error(
+            `The active ${symbol} protective stop does not match the broker position; inspect Alpaca before continuing`,
+          );
+        position.stopPrice = actualStopPrice;
+        const expiresAt = Date.parse(String(existingStop?.expires_at || ""));
+        if (
+          Number.isFinite(expiresAt) &&
+          expiresAt - Date.now() <= GTC_STOP_RENEWAL_WINDOW_MS
+        )
+          renewStop = true;
+      } else {
+        throw new Error(
+          `The ${symbol} protective stop has status ${status || "unknown"}; inspect Alpaca before continuing`,
+        );
+      }
+    }
+
     const quote = await getQuote(symbol, "SELL");
-    const highestClose = Math.max(position.highestClose, latest.close);
     const currentAtr =
-      atr ||
-      (position.entryPrice - position.stopPrice) / config.atrStopMultiple;
+      typeof atr === "number" && Number.isFinite(atr) && atr > 0
+        ? atr
+        : (position.entryPrice - position.stopPrice) / config.atrStopMultiple;
+    if (!Number.isFinite(currentAtr) || currentAtr <= 0)
+      throw new Error(`Cannot calculate a valid trailing stop for ${symbol}; inspect the position state`);
+    const highestClose = Math.max(position.highestClose, latest.close);
     const trailingStop = Math.max(
       position.stopPrice,
       highestClose - currentAtr * config.atrStopMultiple,
     );
-    if (trailingStop > position.stopPrice && submit) {
+
+    const nextStop = Number(Math.max(position.stopPrice, trailingStop).toFixed(2));
+    const updateStopOrder = renewStop || nextStop > position.stopPrice;
+    if (updateStopOrder) {
+      if (nextStop <= 0 || nextStop >= quote.bid)
+        throw new Error(
+          `The calculated ${symbol} protective stop (${nextStop}) is at or above the current bid (${quote.bid}); review the position manually`,
+        );
+      const replacementOrder = {
+        symbol,
+        qty: String(position.quantity),
+        side: "sell",
+        type: "stop",
+        time_in_force: "gtc",
+        stop_price: String(nextStop),
+      };
+      if (!submit)
+        return {
+          symbol,
+          bar: latest.date,
+          action: renewStop ? "preview protective stop renewal" : "preview trailing stop update",
+          quantity: position.quantity,
+          stopPrice: nextStop,
+          preview: { order: replacementOrder, quote },
+        };
+
       state.inFlight = `${latest.date}:STOP_UPDATE`;
+      state.pendingStopOrderClientId ||= `auto-stop-${symbol.toLowerCase()}-${randomUUID()}`;
       saveState(statePath, state);
-      try {
-        await updateStop(baseUrl, state, trailingStop);
-      } catch (error) {
-        // Keep the recovery marker: Alpaca may have applied a modify request even if the response was lost.
-        throw error;
+      await updateStop(baseUrl, state, nextStop, true);
+      state.inFlight = null;
+      state.pendingStopOrderClientId = null;
+      position.highestClose = highestClose;
+      state.lastProcessedBar = latest.date;
+      saveState(statePath, state);
+      return {
+        symbol,
+        bar: latest.date,
+        action: renewStop ? "renewed protective stop" : "updated trailing stop",
+        quantity: position.quantity,
+        stopPrice: position.stopPrice,
+        stopOrderId: position.stopOrderId,
+      };
+    }
+
+    if (exitSignal(indicators, index)) {
+      const exitOrder = {
+        symbol,
+        qty: String(position.quantity),
+        type: "limit",
+        limit_price: String(quote.bid),
+        side: "sell",
+        time_in_force: "day",
+        extended_hours: false,
+      };
+      const payload = exitOrder;
+      const preview = { order: exitOrder, quote };
+      if (!submit)
+        return {
+          symbol,
+          bar: latest.date,
+          action: "preview indicator exit",
+          quantity: position.quantity,
+          limitPrice: quote.bid,
+          preview,
+        };
+      state.inFlight = `${latest.date}:EXIT`;
+      saveState(statePath, state);
+      if (position.stopOrderId)
+        await cancelStopAndConfirm(baseUrl, position.stopOrderId);
+      const brokerResponse = await submitPayload(baseUrl, payload);
+      const items = Array.isArray(brokerResponse)
+        ? brokerResponse
+        : [brokerResponse];
+      if (
+        items.some(
+          (item: any) =>
+            item?.error || (item?.id && Array.isArray(item?.message)),
+        )
+      ) {
+        throw new Error(
+          `Alpaca rejected the exit order after the protective stop was canceled. Inspect the account immediately: ${JSON.stringify(brokerResponse)}`,
+        );
       }
+      const exitOrderId = String(items[0]?.id || "");
+      if (!exitOrderId)
+        throw new Error(
+          `Alpaca returned no exit order ID and the protective stop is canceled; inspect the account immediately: ${JSON.stringify(brokerResponse)}`,
+        );
+      state.exitOrderId = exitOrderId;
+      state.inFlight = null;
+      state.lastProcessedBar = latest.date;
+      saveState(statePath, state);
+      return {
+        symbol,
+        bar: latest.date,
+        action: "submitted indicator exit",
+        quantity: position.quantity,
+        limitPrice: quote.bid,
+        exitOrderId,
+      };
     }
     position.highestClose = highestClose;
     state.lastProcessedBar = latest.date;
-    state.inFlight = null;
     if (submit) saveState(statePath, state);
     return {
       symbol,
       bar: latest.date,
       action: "hold",
       quantity: position.quantity,
-      stopPrice: submit ? position.stopPrice : trailingStop,
+      stopPrice: position.stopPrice,
       quote,
     };
   }
@@ -772,6 +1152,24 @@ export async function runAutonomousCycle(
     .filter((position) => Number(position?.qty || 0) !== 0)
     .map((position) => String(position.symbol || "").toUpperCase())
     .filter((symbol) => /^[A-Z0-9.-]{1,16}$/.test(symbol));
+  const manageableHeldSymbols = accountPositions
+    .filter((position) => {
+      const quantity = Number(position?.qty || 0);
+      return quantity > 0 && Number.isInteger(quantity);
+    })
+    .map((position) => String(position.symbol || "").toUpperCase())
+    .filter((symbol) => /^[A-Z0-9.-]{1,16}$/.test(symbol));
+  const unmanagedPositions = accountPositions
+    .map((position) => ({
+      symbol: String(position.symbol || "").toUpperCase(),
+      quantity: Number(position?.qty || 0),
+    }))
+    .filter(
+      (position) => position.quantity < 0 || (position.quantity > 0 && !Number.isInteger(position.quantity)),
+    );
+  const unmanagedPositionSymbols = new Set(
+    unmanagedPositions.map((position) => position.symbol),
+  );
   const trackedSymbols = new Set<string>();
   if (fs.existsSync(dataDir)) {
     for (const name of fs.readdirSync(dataDir)) {
@@ -784,9 +1182,19 @@ export async function runAutonomousCycle(
   }
 
   // Reconcile and manage an existing bot position or pending action before scanning entries.
-  const managedSymbols = [...new Set([...heldSymbols, ...trackedSymbols])];
+  const managedSymbols = [...new Set([
+    ...manageableHeldSymbols,
+    ...[...trackedSymbols].filter((symbol) => !unmanagedPositionSymbols.has(symbol)),
+  ])];
   const openOrders = await getOpenOrders(baseUrl);
-  const decisions: Record<string, unknown>[] = [];
+  const decisions: Record<string, unknown>[] = unmanagedPositions.map((position) => ({
+    symbol: position.symbol,
+    action: "existing position left unmanaged",
+    quantity: position.quantity,
+    reason: position.quantity < 0
+      ? "automatic strategy manages long positions only"
+      : "automatic stop orders require whole-share quantities",
+  }));
   for (const symbol of managedSymbols) {
     decisions.push(
       await runAutomaticOnce({
@@ -831,7 +1239,9 @@ export async function runAutonomousCycle(
       .filter(Boolean),
   );
 
-  for (const symbol of symbols.filter((candidate) => !managedSymbols.includes(candidate))) {
+  for (const symbol of symbols.filter(
+    (candidate) => !heldSymbols.includes(candidate) && !trackedSymbols.has(candidate),
+  )) {
     if (activePositionCount >= maxOpenPositions) break;
     if (openBuySymbols.has(symbol)) {
       decisions.push({
