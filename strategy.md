@@ -4,23 +4,23 @@ This project is a research bot with an optional, explicitly gated Alpaca automat
 
 ## Design goal
 
-The strategy is deliberately long-only and low-turnover. It is intended for a beginner using unleveraged stocks first, with spot crypto as an optional higher-risk experiment. The automatic stock scanner can hold a diversified basket, risks a fixed fraction of equity per position, and refuses to open a position when the fee-adjusted order cannot fit the cash/buying-power budget.
+The signal model is long-only and uses daily EMA, RSI, and ATR indicators. The automatic stock runner checks it every minute during market hours using the latest quote as a provisional daily close, and can rotate out of a weaker holding when a stronger eligible candidate clears the configured score advantage. This can increase turnover compared with the daily-bar backtest, which does not model intraday signals or portfolio rotation. It is intended for unleveraged stocks first, with spot crypto as an optional higher-risk research experiment. The automatic stock scanner can hold a diversified basket, risks a fixed fraction of equity per position, and refuses to open a position when the order cannot fit the buying-power budget.
 
 ## Entry
 
-On a daily close, the strategy schedules a buy for the next bar's open when all conditions hold:
+In the backtest, a completed daily close schedules a buy for the next bar's open when all conditions hold. The automatic runner evaluates the same EMA/RSI thresholds with the live quote as a provisional close during regular market hours and can submit an entry during that session:
 
 1. 10-day EMA is above the 30-day EMA: the primary trend is up.
 2. RSI(14) is between 45 and 68: momentum is positive but not yet extremely extended.
 3. ATR(14) exists: volatility is available for sizing and the stop.
 
-The next-open execution avoids look-ahead bias from using a closing price that was not known at order time.
+The backtest's next-open execution avoids look-ahead bias from using a closing price that was not known at order time. The live runner's intraday quote evaluation is not represented by that backtest.
 
 ## Exit and risk
 
 - Initial stop: entry price minus 2.5 ATR.
 - Trailing stop: the highest closing price since entry minus 2.5 ATR. It only moves upward.
-- Indicator exit: schedules an exit for the next open if the fast EMA falls below the slow EMA or RSI reaches 74.
+- Indicator exit: the backtest schedules an exit for the next open if the fast EMA falls below the slow EMA or RSI reaches 74. The live runner submits an exit during market hours when that rule holds at the current quote, and can also exit to rotate into a stronger candidate.
 - Position sizing: the smaller of (a) `riskPerTrade` of current equity divided by the ATR stop distance, (b) `maxPositionPct` of equity, and (c) the remaining portfolio/buying-power budget. The default automatic stock configuration allows up to 95% total long allocation across at most 10 positions, with a 10% per-position cap. Stocks are whole-share by default; crypto can use decimals.
 - No leverage, shorting, pyramiding, or overnight financing is modeled.
 

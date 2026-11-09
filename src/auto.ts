@@ -30,6 +30,8 @@ export interface AutoConfig {
   maxPortfolioPct?: number;
   /** Maximum number of simultaneous long positions, including pending entries. */
   maxOpenPositions?: number;
+  /** Minimum signal score advantage required to rotate into a stronger candidate. */
+  rotationMinAdvantage?: number;
   atrStopMultiple: number;
   indicators: IndicatorSettings;
   scanSymbols?: string[];
@@ -46,6 +48,10 @@ export interface AutoOptions {
   allocationBudget?: number;
   /** Current broker buying power, used as a hard cash ceiling. */
   buyingPower?: number;
+  /** Reason to exit this holding in favor of a stronger candidate. */
+  forceExitReason?: string;
+  /** Reason to cancel an unfilled entry in favor of a stronger candidate. */
+  cancelPendingEntryReason?: string;
 }
 
 export interface AutonomousOptions {
@@ -73,6 +79,8 @@ interface AutoState {
   inFlight: string | null;
   pendingStopOrderClientId?: string | null;
   exitOrderId?: string | null;
+  exitReason?: string | null;
+  lastExitBar?: string | null;
 }
 
 const NEW_YORK_TZ = "America/New_York";
@@ -88,6 +96,7 @@ const ACTIVE_ORDER_STATUSES = new Set([
   "presubmitted",
   "pending_submit",
   "pending submit",
+  "pending_replace",
   "partially filled",
   "pending",
 ]);
@@ -226,6 +235,13 @@ function openPositionCap(config: AutoConfig, universeSize: number): number {
   return value;
 }
 
+function rotationAdvantage(config: AutoConfig): number {
+  const value = config.rotationMinAdvantage ?? 0.25;
+  if (!Number.isFinite(value) || value < 0)
+    throw new Error("rotationMinAdvantage must be a finite non-negative number");
+  return value;
+}
+
 function orderNotional(order: any): number {
   const quantity = Math.abs(Number(order?.qty || order?.quantity || 0));
   const price = Number(order?.limit_price || order?.stop_price || 0);
@@ -280,6 +296,75 @@ async function getDailyHistory(
       "Alpaca daily history spans less than two calendar years; no strategy action taken",
     );
   return uniqueBars;
+}
+
+async function getOpportunitySnapshot(
+  symbol: string,
+  settings: IndicatorSettings,
+  side: "BUY" | "SELL" = "BUY",
+): Promise<{ eligible: boolean; score: number } | null> {
+  const bars = await getDailyHistory(symbol);
+  const today = newYorkDate(Date.now());
+  const closedBars = bars.filter((bar) => bar.date < today);
+  if (closedBars.length < 40) return null;
+  const latest = closedBars[closedBars.length - 1];
+  const price = isRegularSession()
+    ? (await getQuote(symbol, side)).referencePrice
+    : latest.close;
+  const live = indicatorsAtPrice(
+    closedBars,
+    bars.find((bar) => bar.date === today) || null,
+    settings,
+    price,
+    today,
+  );
+  const { indicators, index } = live;
+  const fast = indicators.fastEma[index];
+  const slow = indicators.slowEma[index];
+  const rsi = indicators.rsi[index];
+  const atr = indicators.atr[index];
+  if (
+    typeof fast !== "number" ||
+    typeof slow !== "number" ||
+    typeof rsi !== "number" ||
+    typeof atr !== "number" ||
+    atr <= 0
+  ) return null;
+  const trendStrength = (fast - slow) / atr;
+  const rsiQuality = 1 - Math.abs(rsi - 56) / 23;
+  return {
+    eligible: entrySignal(indicators, index),
+    score: trendStrength + rsiQuality * 0.25,
+  };
+}
+
+function indicatorsAtPrice(
+  closedBars: Bar[],
+  formingBar: Bar | null,
+  settings: IndicatorSettings,
+  price: number,
+  date: string,
+) {
+  const previousClose = closedBars[closedBars.length - 1].close;
+  const base = formingBar || {
+    date,
+    open: previousClose,
+    high: Math.max(previousClose, price),
+    low: Math.min(previousClose, price),
+    close: price,
+    volume: null,
+  };
+  const liveBar: Bar = {
+    ...base,
+    high: Math.max(base.high, price),
+    low: Math.min(base.low, price),
+    close: price,
+  };
+  const liveBars = [...closedBars, liveBar];
+  return {
+    indicators: buildIndicators(liveBars, settings),
+    index: liveBars.length - 1,
+  };
 }
 
 async function submitPayload(
@@ -394,6 +479,33 @@ async function cancelStopAndConfirm(
   throw new Error(
     "Alpaca has not confirmed cancellation of the protective stop; strategy exit was not submitted",
   );
+}
+
+async function cancelEntryAndConfirm(
+  baseUrl: string,
+  orderId: string,
+): Promise<void> {
+  const existing = await getOrder(baseUrl, orderId);
+  const existingStatus = orderStatus(existing);
+  if (["cancelled", "canceled", "expired", "rejected"].includes(existingStatus)) return;
+  if (existingStatus === "filled")
+    throw new Error("Pending entry filled while a stronger candidate was being selected; reconcile the position before continuing");
+  if (!isActiveOrderStatus(existingStatus) && existingStatus !== "pending_cancel")
+    throw new Error(`Cannot safely cancel pending entry in status ${existingStatus || "unknown"}; inspect Alpaca before continuing`);
+  if (existingStatus !== "pending_cancel")
+    await request(
+      baseUrl,
+      `/v2/orders/${encodeURIComponent(orderId)}`,
+      { method: "DELETE" },
+    );
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const status = orderStatus(await getOrder(baseUrl, orderId));
+    if (["cancelled", "canceled", "expired", "rejected"].includes(status)) return;
+    if (status === "filled")
+      throw new Error("Pending entry filled while its cancellation was processing; reconcile the position before continuing");
+  }
+  throw new Error("Alpaca has not confirmed cancellation of the pending entry; it remains reserved until reconciled");
 }
 
 async function recoverStopUpdate(
@@ -550,7 +662,7 @@ export async function runAutomaticOnce(
     csvForBars(bars),
   );
 
-  // Ignore today's still-forming daily candle. Signals use only completed sessions.
+  // Keep ATR sizing anchored to completed sessions; refresh EMA/RSI signals with the live price.
   const today = newYorkDate(Date.now());
   const closedBars = bars.filter((bar) => bar.date < today);
   if (closedBars.length < 40)
@@ -574,23 +686,66 @@ export async function runAutomaticOnce(
     const status = String(
       exitStatus?.status || "",
     ).toLowerCase();
-    if (
-      [
-        "new",
-        "accepted",
-        "pending_new",
-        "partially_filled",
-        "submitted",
-        "presubmitted",
-        "pending submit",
-        "partially filled",
-        "pending",
-      ].includes(status)
-    ) {
+    if (status === "replaced" && exitStatus?.replaced_by) {
+      state.exitOrderId = String(exitStatus.replaced_by);
+      saveState(statePath, state);
       return {
         symbol,
         bar: latest.date,
-        action: "indicator exit awaiting fill",
+        action: "reconciling replaced exit order",
+        orderId: state.exitOrderId,
+      };
+    }
+    const exitKind = state.exitReason?.startsWith("rotating into") ? "rotation" : "indicator";
+    if (isActiveOrderStatus(status)) {
+      if (
+        String(exitStatus?.symbol || "").toUpperCase() !== symbol.toUpperCase() ||
+        orderSide(exitStatus) !== "sell" ||
+        orderType(exitStatus) !== "limit"
+      )
+        throw new Error(`Pending ${symbol} exit order does not match the saved sell order; inspect Alpaca before continuing`);
+      if (isRegularSession() && status !== "pending_replace") {
+        const quote = await getQuote(symbol, "SELL");
+        const currentLimit = Number(exitStatus?.limit_price || 0);
+        const nextLimit = Number(Math.min(currentLimit, quote.bid).toFixed(2));
+        if (!Number.isFinite(currentLimit) || currentLimit <= 0 || nextLimit <= 0)
+          throw new Error(`Pending ${symbol} exit has an invalid limit price; inspect Alpaca before continuing`);
+        if (nextLimit < currentLimit) {
+          if (!submit)
+            return {
+              symbol,
+              bar: latest.date,
+              action: `preview ${exitKind} exit repricing`,
+              orderId: exitOrderId,
+              previousLimitPrice: currentLimit,
+              limitPrice: nextLimit,
+              quote,
+            };
+          const replacement = await request(
+            baseUrl,
+            `/v2/orders/${encodeURIComponent(exitOrderId)}`,
+            { method: "PATCH", body: JSON.stringify({ limit_price: String(nextLimit) }) },
+          );
+          const replacementId = String(replacement?.id || "");
+          if (!replacementId)
+            throw new Error(`Alpaca returned no replacement ${symbol} exit order ID; inspect orders before continuing`);
+          state.exitOrderId = replacementId;
+          saveState(statePath, state);
+          return {
+            symbol,
+            bar: latest.date,
+            action: `repriced pending ${exitKind} exit`,
+            previousOrderId: exitOrderId,
+            orderId: replacementId,
+            previousLimitPrice: currentLimit,
+            limitPrice: nextLimit,
+          };
+        }
+      }
+      return {
+        symbol,
+        bar: latest.date,
+        action: `${exitKind} exit awaiting fill`,
         orderId: exitOrderId,
         status,
       };
@@ -602,12 +757,14 @@ export async function runAutomaticOnce(
         );
       state.position = null;
       state.exitOrderId = null;
+      state.exitReason = null;
       state.lastProcessedBar = latest.date;
+      state.lastExitBar = latest.date;
       saveState(statePath, state);
       return {
         symbol,
         bar: latest.date,
-        action: "indicator exit filled",
+        action: `${exitKind} exit filled`,
         orderId: exitOrderId,
       };
     }
@@ -624,7 +781,41 @@ export async function runAutomaticOnce(
     const parentOrderId = pendingPosition.parentOrderId;
     const parentOrder = await getOrder(baseUrl, parentOrderId);
     const parentStatus = orderStatus(parentOrder);
-    if (isActiveOrderStatus(parentStatus))
+    if (isActiveOrderStatus(parentStatus)) {
+      if (held === 0 && isRegularSession()) {
+        const quote = await getQuote(symbol, "BUY");
+        const liveSignals = indicatorsAtPrice(
+          closedBars,
+          bars.find((bar) => bar.date === today) || null,
+          config.indicators,
+          quote.referencePrice,
+          today,
+        );
+        const signalStillEligible = entrySignal(liveSignals.indicators, liveSignals.index);
+        const cancelReason = options.cancelPendingEntryReason ||
+          (!signalStillEligible ? "entry signal no longer qualifies at the live quote" : null);
+        if (cancelReason) {
+          if (!submit)
+            return {
+              symbol,
+              bar: latest.date,
+              action: "preview cancel pending entry",
+              orderId: parentOrderId,
+              reason: cancelReason,
+            };
+          await cancelEntryAndConfirm(baseUrl, parentOrderId);
+          state.position = null;
+          state.lastProcessedBar = latest.date;
+          saveState(statePath, state);
+          return {
+            symbol,
+            bar: latest.date,
+            action: "cancelled pending entry",
+            orderId: parentOrderId,
+            reason: cancelReason,
+          };
+        }
+      }
       return {
         symbol,
         bar: latest.date,
@@ -632,6 +823,7 @@ export async function runAutomaticOnce(
         orderId: parentOrderId,
         status: parentStatus,
       };
+    }
     if (parentStatus === "filled") {
       const stopOrderId = String(parentOrder?.legs?.[0]?.id || "");
       if (!stopOrderId)
@@ -666,6 +858,7 @@ export async function runAutomaticOnce(
     if (stopState === "filled") {
       const stopOrderId = closedPosition.stopOrderId;
       state.position = null;
+      state.lastExitBar = latest.date;
       state.lastProcessedBar = latest.date;
       saveState(statePath, state);
       return {
@@ -718,7 +911,7 @@ export async function runAutomaticOnce(
     state.position = null;
     state.lastProcessedBar = latest.date;
   }
-  if (held === 0 && !state.position && state.lastProcessedBar === latest.date)
+  if (held === 0 && !state.position && state.lastExitBar === latest.date)
     return { symbol, bar: latest.date, action: "already processed", submit };
   if (submit && !isRegularSession())
     return {
@@ -878,7 +1071,16 @@ export async function runAutomaticOnce(
       }
     }
 
-    const quote = await getQuote(symbol, "SELL");
+    const quote = isRegularSession()
+      ? await getQuote(symbol, "SELL")
+      : { bid: latest.close, ask: latest.close, referencePrice: latest.close, updatedAt: "" };
+    const liveSignals = indicatorsAtPrice(
+      closedBars,
+      bars.find((bar) => bar.date === today) || null,
+      config.indicators,
+      quote.referencePrice,
+      today,
+    );
     const currentAtr =
       typeof atr === "number" && Number.isFinite(atr) && atr > 0
         ? atr
@@ -892,7 +1094,9 @@ export async function runAutomaticOnce(
     );
 
     const nextStop = Number(Math.max(position.stopPrice, trailingStop).toFixed(2));
-    const updateStopOrder = renewStop || nextStop > position.stopPrice;
+    const exitReason = options.forceExitReason ||
+      (exitSignal(liveSignals.indicators, liveSignals.index) ? "indicator exit" : null);
+    const updateStopOrder = (renewStop || nextStop > position.stopPrice) && !exitReason;
     if (updateStopOrder) {
       if (nextStop <= 0 || nextStop >= quote.bid)
         throw new Error(
@@ -935,7 +1139,7 @@ export async function runAutomaticOnce(
       };
     }
 
-    if (exitSignal(indicators, index)) {
+    if (exitReason) {
       const exitOrder = {
         symbol,
         qty: String(position.quantity),
@@ -951,9 +1155,10 @@ export async function runAutomaticOnce(
         return {
           symbol,
           bar: latest.date,
-          action: "preview indicator exit",
+          action: exitReason === "indicator exit" ? "preview indicator exit" : "preview rotation exit",
           quantity: position.quantity,
           limitPrice: quote.bid,
+          reason: exitReason,
           preview,
         };
       state.inFlight = `${latest.date}:EXIT`;
@@ -980,15 +1185,17 @@ export async function runAutomaticOnce(
           `Alpaca returned no exit order ID and the protective stop is canceled; inspect the account immediately: ${JSON.stringify(brokerResponse)}`,
         );
       state.exitOrderId = exitOrderId;
+      state.exitReason = exitReason;
       state.inFlight = null;
       state.lastProcessedBar = latest.date;
       saveState(statePath, state);
       return {
         symbol,
         bar: latest.date,
-        action: "submitted indicator exit",
+        action: exitReason === "indicator exit" ? "submitted indicator exit" : "submitted rotation exit",
         quantity: position.quantity,
         limitPrice: quote.bid,
+        reason: exitReason,
         exitOrderId,
       };
     }
@@ -1005,13 +1212,21 @@ export async function runAutomaticOnce(
     };
   }
 
-  if (!entrySignal(indicators, index) || typeof atr !== "number" || atr <= 0) {
+  const quote = isRegularSession()
+    ? await getQuote(symbol, "BUY")
+    : { bid: latest.close, ask: latest.close, referencePrice: latest.close, updatedAt: "" };
+  const liveSignals = indicatorsAtPrice(
+    closedBars,
+    bars.find((bar) => bar.date === today) || null,
+    config.indicators,
+    quote.referencePrice,
+    today,
+  );
+  if (!entrySignal(liveSignals.indicators, liveSignals.index) || typeof atr !== "number" || atr <= 0) {
     state.lastProcessedBar = latest.date;
     if (submit) saveState(statePath, state);
     return { symbol, bar: latest.date, action: "no entry signal", submit };
   }
-
-  const quote = await getQuote(symbol, "BUY");
   const stopPrice = Number(
     (quote.ask - atr * config.atrStopMultiple).toFixed(2),
   );
@@ -1147,6 +1362,7 @@ export async function runAutonomousCycle(
     throw new Error("Add one or more candidate tickers to scanSymbols in the config file");
   const maxPortfolioPct = portfolioCap(options.config);
   const maxOpenPositions = openPositionCap(options.config, symbols.length);
+  const minRotationAdvantage = rotationAdvantage(options.config);
   const accountPositions = await getPositions(baseUrl);
   const heldSymbols = accountPositions
     .filter((position) => Number(position?.qty || 0) !== 0)
@@ -1171,11 +1387,13 @@ export async function runAutonomousCycle(
     unmanagedPositions.map((position) => position.symbol),
   );
   const trackedSymbols = new Set<string>();
+  const trackedStates = new Map<string, AutoState>();
   if (fs.existsSync(dataDir)) {
     for (const name of fs.readdirSync(dataDir)) {
       if (!/^auto-[A-Z0-9.-]+\.json$/i.test(name)) continue;
       const state = JSON.parse(fs.readFileSync(path.join(dataDir, name), "utf8")) as AutoState;
       if (state.accountId !== account.id) continue;
+      trackedStates.set(state.symbol.toUpperCase(), state);
       if (state.position || state.inFlight || state.exitOrderId)
         trackedSymbols.add(state.symbol.toUpperCase());
     }
@@ -1187,6 +1405,15 @@ export async function runAutonomousCycle(
     ...[...trackedSymbols].filter((symbol) => !unmanagedPositionSymbols.has(symbol)),
   ])];
   const openOrders = await getOpenOrders(baseUrl);
+  const positivePositions = accountPositions.filter((position) => Number(position?.qty || 0) > 0);
+  const openBuyOrders = openOrders.filter(
+    (order) => String(order?.side || "").toLowerCase() === "buy",
+  );
+  const openBuySymbols = new Set(
+    openBuyOrders
+      .map((order) => String(order?.symbol || "").toUpperCase())
+      .filter(Boolean),
+  );
   const decisions: Record<string, unknown>[] = unmanagedPositions.map((position) => ({
     symbol: position.symbol,
     action: "existing position left unmanaged",
@@ -1195,28 +1422,135 @@ export async function runAutonomousCycle(
       ? "automatic strategy manages long positions only"
       : "automatic stop orders require whole-share quantities",
   }));
+
+  const rotationReasons = new Map<string, string>();
+  const preferredEntrySymbols: string[] = [];
+  const pendingEntrySymbols = [...trackedStates.entries()]
+    .filter(([symbol, state]) =>
+      !heldSymbols.includes(symbol) &&
+      Boolean(state.position?.parentOrderId) &&
+      !state.position?.stopOrderId &&
+      !state.exitOrderId,
+    )
+    .map(([symbol]) => symbol);
+  const occupiedSlots = positivePositions.length +
+    [...trackedSymbols].filter((symbol) => !heldSymbols.includes(symbol)).length;
+  if (occupiedSlots >= maxOpenPositions && (manageableHeldSymbols.length > 0 || pendingEntrySymbols.length > 0)) {
+    const commitments: Array<{ symbol: string; score: number; kind: "holding" | "pending entry" }> = [];
+    for (const symbol of manageableHeldSymbols.filter((heldSymbol) => !trackedStates.get(heldSymbol)?.exitOrderId)) {
+      try {
+        const snapshot = await getOpportunitySnapshot(symbol, options.config.indicators, "SELL");
+        if (snapshot) commitments.push({ symbol, score: snapshot.score, kind: "holding" });
+      } catch (error) {
+        decisions.push({
+          symbol,
+          action: "rotation comparison skipped",
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    for (const symbol of pendingEntrySymbols) {
+      try {
+        const snapshot = await getOpportunitySnapshot(symbol, options.config.indicators);
+        if (snapshot?.eligible) {
+          commitments.push({
+            symbol,
+            score: snapshot.score,
+            kind: "pending entry",
+          });
+        } else if (snapshot) {
+          rotationReasons.set(symbol, "pending entry signal no longer qualifies at the live quote");
+          decisions.push({
+            symbol,
+            action: "pending entry signal weakened",
+            reason: "cancel the unfilled order and release its slot",
+          });
+        }
+      } catch (error) {
+        decisions.push({
+          symbol,
+          action: "pending entry comparison skipped",
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    const candidates: Array<{ symbol: string; score: number }> = [];
+    for (const symbol of symbols.filter(
+      (candidate) => !heldSymbols.includes(candidate) && !trackedSymbols.has(candidate) && !openBuySymbols.has(candidate),
+    )) {
+      try {
+        const snapshot = await getOpportunitySnapshot(symbol, options.config.indicators);
+        if (snapshot?.eligible) candidates.push({ symbol, score: snapshot.score });
+      } catch (error) {
+        decisions.push({
+          symbol,
+          action: "rotation candidate skipped",
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    const weakestCommitment = commitments.reduce<typeof commitments[number] | null>(
+      (weakest, commitment) => !weakest || commitment.score < weakest.score ? commitment : weakest,
+      null,
+    );
+    const strongestCandidate = candidates.reduce<typeof candidates[number] | null>(
+      (strongest, candidate) => !strongest || candidate.score > strongest.score ? candidate : strongest,
+      null,
+    );
+    if (
+      weakestCommitment &&
+      strongestCandidate &&
+      strongestCandidate.symbol !== weakestCommitment.symbol &&
+      strongestCandidate.score - weakestCommitment.score > minRotationAdvantage
+    ) {
+      const advantage = strongestCandidate.score - weakestCommitment.score;
+      const reason = weakestCommitment.kind === "pending entry"
+        ? `canceling this unfilled entry for ${strongestCandidate.symbol}: candidate score ${strongestCandidate.score.toFixed(2)} exceeds this entry's ${weakestCommitment.score.toFixed(2)} by ${advantage.toFixed(2)}`
+        : `rotating into ${strongestCandidate.symbol}: candidate score ${strongestCandidate.score.toFixed(2)} exceeds this holding's ${weakestCommitment.score.toFixed(2)} by ${advantage.toFixed(2)}`;
+      rotationReasons.set(weakestCommitment.symbol, reason);
+      preferredEntrySymbols.push(strongestCandidate.symbol);
+      decisions.push({
+        symbol: weakestCommitment.symbol,
+        action: "stronger candidate found",
+        candidate: strongestCandidate.symbol,
+        commitment: weakestCommitment.kind,
+        commitmentScore: weakestCommitment.score,
+        candidateScore: strongestCandidate.score,
+        minimumAdvantage: minRotationAdvantage,
+      });
+    }
+  }
+
+  const cancelledPendingOrderIds = new Set<string>();
   for (const symbol of managedSymbols) {
-    decisions.push(
-      await runAutomaticOnce({
+    const decision = await runAutomaticOnce({
         symbol,
         equity: account.equity,
         config: options.config,
         submit: options.submit,
         allowPaper: options.allowPaper,
         dataDir,
-      }),
-    );
+        forceExitReason: rotationReasons.get(symbol),
+        cancelPendingEntryReason: rotationReasons.get(symbol),
+      });
+    decisions.push(decision);
+    if (decision.action === "cancelled pending entry") {
+      cancelledPendingOrderIds.add(String(decision.orderId || ""));
+      trackedSymbols.delete(symbol);
+      if (!openBuyOrders.some((order) =>
+        String(order?.symbol || "").toUpperCase() === symbol &&
+        !cancelledPendingOrderIds.has(String(order?.id || "")),
+      )) openBuySymbols.delete(symbol);
+    }
   }
 
-  const positivePositions = accountPositions.filter((position) => Number(position?.qty || 0) > 0);
   const existingLongNotional = positivePositions.reduce(
     (sum, position) => sum + longPositionNotional(position),
     0,
   );
-  const openBuyOrders = openOrders.filter(
-    (order) => String(order?.side || "").toLowerCase() === "buy",
-  );
-  const openBuyNotional = openBuyOrders.reduce(
+  const openBuyNotional = openBuyOrders.filter(
+    (order) => !cancelledPendingOrderIds.has(String(order?.id || "")),
+  ).reduce(
     (sum, order) => sum + orderNotional(order),
     0,
   );
@@ -1233,15 +1567,10 @@ export async function runAutonomousCycle(
   let remainingBuyingPower = availableBuyingPower;
   let activePositionCount = positivePositions.length +
     [...trackedSymbols].filter((symbol) => !heldSymbols.includes(symbol)).length;
-  const openBuySymbols = new Set(
-    openBuyOrders
-      .map((order) => String(order?.symbol || "").toUpperCase())
-      .filter(Boolean),
-  );
-
-  for (const symbol of symbols.filter(
+  const entryCandidates = [...new Set([...preferredEntrySymbols, ...symbols])].filter(
     (candidate) => !heldSymbols.includes(candidate) && !trackedSymbols.has(candidate),
-  )) {
+  );
+  for (const symbol of entryCandidates) {
     if (activePositionCount >= maxOpenPositions) break;
     if (openBuySymbols.has(symbol)) {
       decisions.push({

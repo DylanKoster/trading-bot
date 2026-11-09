@@ -6,6 +6,7 @@
   "maxPositionPct": 0.1,
   "maxPortfolioPct": 0.95,
   "maxOpenPositions": 10,
+  "rotationMinAdvantage": 0.25,
   "atrStopMultiple": 2.5,
   "scanSymbols": [
     "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO",

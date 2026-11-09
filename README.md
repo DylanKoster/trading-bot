@@ -63,7 +63,7 @@ The included sample is deliberately small and synthetic. It is a smoke test for 
 
 ## Automatic strategy execution
 
-The `auto-trade` command runs continuously and scans the `scanSymbols` candidate list in `config/default.json`. It manages existing bot positions first, then evaluates the remaining candidates and can submit multiple qualifying entries in one cycle. Portfolio allocation is capped by `maxPortfolioPct` and `maxOpenPositions`; each position is capped by `maxPositionPct` and the ATR risk budget. The default list is an editable starter universe, not a recommendation. It ignores the current, still-forming daily candle, uses account equity and broker buying power for sizing, and reserves capital for existing positions and open buy orders. It scans every five minutes by default and retries after temporary API errors. Press Ctrl+C to stop. This scanner uses the IEX bars and quotes already used by the bot; it does not call Alpaca's SIP-only most-active screener.
+The `auto-trade` command runs continuously and scans the `scanSymbols` candidate list in `config/default.json` every minute by default. During regular US market hours, it uses the latest quote as a provisional daily close when checking EMA/RSI signals; outside that session it uses the last completed close. ATR sizing and protective stops remain anchored to completed daily bars. Unfilled entry orders are canceled when their signal no longer qualifies or a materially stronger candidate appears. Pending sell limits are repriced downward to the current bid when needed to keep an exit marketable. When all position slots are occupied, the scanner compares eligible candidates with current holdings using the normalized fast/slow EMA spread and RSI fit; it exits the weakest holding when a candidate's score beats it by more than `rotationMinAdvantage` (default `0.25`). After that sell fills, a later cycle can enter the stronger candidate. Portfolio allocation is capped by `maxPortfolioPct` and `maxOpenPositions`; each position is capped by `maxPositionPct` and the ATR risk budget. The default list is an editable starter universe, not a recommendation. It uses account equity and broker buying power for sizing, and reserves capital for existing positions and open buy orders. The scanner retries after temporary API errors. Press Ctrl+C to stop. It uses the IEX bars and quotes already used by the bot; it does not call Alpaca's SIP-only most-active screener.
 
 Preview mode does not submit orders:
 
@@ -87,7 +87,7 @@ Live automation remains separately gated by `ALPACA_BASE_URL=https://api.alpaca.
 ```bash
 export ALPACA_BASE_URL=https://api.alpaca.markets
 export LIVE_TRADING_ENABLED=true
-node dist/src/cli.js auto-trade --config config/default.json --interval-minutes 5 \
+node dist/src/cli.js auto-trade --config config/default.json --interval-minutes 1 \
   --live --confirm-auto-trading "ENABLE AUTONOMOUS AUTO TRADING"
 ```
 
@@ -106,6 +106,7 @@ Copy `config/default.json` and change:
 - `maxPositionPct`: maximum notional allocation
 - `maxPortfolioPct`: maximum fraction of equity allocated across all long positions
 - `maxOpenPositions`: maximum simultaneous positions, including pending entries
+- `rotationMinAdvantage`: minimum signal-score lead required to sell a weaker holding for a stronger candidate
 - `scanSymbols`: candidate stock symbols the strategy may choose among
 - `atrStopMultiple`, `slippageBps`, and indicator periods
 - `allowFractionalShares`: set `true` for fractional stock sizing when the chosen venue and instrument support it
